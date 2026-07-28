@@ -217,18 +217,31 @@ class TelegramBot:
 
         @self.bot.message_handler(commands=['start', 'help'])
         def send_welcome(message):
-            self.bot.reply_to(message, "你好！请直接发送护照图片给我，我会自动识别并录入Excel。")
+            self.safe_reply(message, "你好！请直接发送护照图片给我，我会自动识别并录入Excel。")
             self.log_queue.put(f"收到来自 {message.from_user.first_name} 的 /start 或 /help 命令",
                                target_tab="Telegram")
 
         @self.bot.message_handler(func=lambda message: True)
         def echo_all(message):
-            self.bot.reply_to(message, "我只能处理护照图片哦，请直接发送图片给我。")
+            self.safe_reply(message, "我只能处理护照图片哦，请直接发送图片给我。")
             self.log_queue.put(f"收到来自 {message.from_user.first_name} 的非图片消息: {message.text}",
                                target_tab="Telegram")
 
     def set_polling_interval(self, minutes):
         self.polling_interval_minutes = max(1, minutes)  # 最小1分钟
+
+    def safe_reply(self, message, text):
+        """安全回复消息，如果原消息被删除则直接发送到频道"""
+        try:
+            self.bot.reply_to(message, text)
+        except Exception as e:
+            if "message to be replied not found" in str(e):
+                try:
+                    self.bot.send_message(message.chat.id, text)
+                except Exception as e2:
+                    self.log_queue.put(f"❌ 无法发送消息: {e2}", level="ERROR", target_tab="Telegram")
+            else:
+                self.log_queue.put(f"❌ 回复消息时发生错误: {e}", level="ERROR", target_tab="Telegram")
 
     def process_telegram_photo(self, message):
         try:
@@ -241,23 +254,23 @@ class TelegramBot:
             if success:
                 passport_num = result['passport']
                 if self.excel_manager.check_duplicate(passport_num):
-                    self.bot.reply_to(message, f"⚠️ 护照号 {passport_num} 已存在于 Excel 中，已跳过。")
+                    self.safe_reply(message, f"⚠️ 护照号 {passport_num} 已存在于 Excel 中，已跳过。")
                     self.log_queue.put(f"⚠️ 护照号 {passport_num} 已存在，已跳过。", level="WARNING",
                                        target_tab="Telegram")
                 else:
                     row = self.excel_manager.append_customer(result)
                     if row:
-                        self.bot.reply_to(message,
+                        self.safe_reply(message,
                                           f"✅ 识别成功！姓名: {result['name']}, 护照号: {result['passport']}. 已写入 Excel 第 {row} 行。请在 Excel 中补充日期并将状态改为 PENDING。")
                         self.log_queue.put(
                             f"✅ 识别成功！姓名: {result['name']}, 护照号: {result['passport']}. 已写入 Excel 第 {row} 行。",
                             target_tab="Telegram")
                     else:
-                        self.bot.reply_to(message,
+                        self.safe_reply(message,
                                           f"❌ 识别成功但写入 Excel 失败。")
                         self.log_queue.put(f"❌ 识别成功但写入 Excel 失败。", level="ERROR", target_tab="Telegram")
             else:
-                self.bot.reply_to(message, f"❌ 识别失败: {result}")
+                self.safe_reply(message, f"❌ 识别失败: {result}")
                 self.log_queue.put(f"❌ 识别失败: {result}", level="ERROR", target_tab="Telegram")
 
         except Exception as e:
