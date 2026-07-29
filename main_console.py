@@ -66,7 +66,16 @@ class ExcelManager:
             with self.lock:
                 wb = load_workbook(self.file_path)
                 sheet = wb.active
-                row = sheet.max_row + 1
+                
+                # 寻找第一个真正的空行（B列到L列都为空，忽略A列的数字）
+                row = 2  # 从第2行开始，跳过表头
+                while row <= sheet.max_row:
+                    if all(sheet.cell(row=row, column=c).value is None for c in range(2, 13)):
+                        break  # 找到了空行
+                    row += 1
+                # 如果都没找到空行，就在最后追加
+                if row > sheet.max_row:
+                    row = sheet.max_row + 1
 
                 def format_date_to_str(dt):
                     if not dt: return ""
@@ -137,7 +146,15 @@ class MRZParser:
                 return False, "未识别到任何文字"
 
             # 提取所有文本行，寻找包含 '<' 且长度接近 44 的行
-            lines = [line[1].replace(" ", "").upper() for line in result]
+            # 修复竖版护照问题：将识别为"人"的字符替换回 '<'
+            cleaned_result = []
+            for line in result:
+                # 如果包含 '人'，很可能是竖版护照识别错误
+                if '人' in line[1]:
+                    line[1] = line[1].replace('人', '<')
+                cleaned_result.append(line)
+                
+            lines = [line[1].replace(" ", "").upper() for line in cleaned_result]
             potential_mrz = [l for l in lines if '<' in l and len(l) > 20]
 
             if len(potential_mrz) < 2:
@@ -257,6 +274,8 @@ class TelegramBot:
                     self.safe_reply(message, f"⚠️ 护照号 {passport_num} 已存在于 Excel 中，已跳过。")
                     self.log_queue.put(f"⚠️ 护照号 {passport_num} 已存在，已跳过。", level="WARNING",
                                        target_tab="Telegram")
+                    # 修改点：如果护照已存在，标记为已读
+                    self.last_update_id = message.message_id
                 else:
                     row = self.excel_manager.append_customer(result)
                     if row:
@@ -265,16 +284,21 @@ class TelegramBot:
                         self.log_queue.put(
                             f"✅ 识别成功！姓名: {result['name']}, 护照号: {result['passport']}. 已写入 Excel 第 {row} 行。",
                             target_tab="Telegram")
+                        # 修改点：写入成功，标记为已读
+                        self.last_update_id = message.message_id
                     else:
                         self.safe_reply(message,
                                           f"❌ 识别成功但写入 Excel 失败。")
                         self.log_queue.put(f"❌ 识别成功但写入 Excel 失败。", level="ERROR", target_tab="Telegram")
+                        # 写入失败，不标记为已读，下次重启会重新尝试
             else:
                 self.safe_reply(message, f"❌ 识别失败: {result}")
                 self.log_queue.put(f"❌ 识别失败: {result}", level="ERROR", target_tab="Telegram")
+                # 识别失败，不标记为已读，下次重启会重新尝试
 
         except Exception as e:
             self.log_queue.put(f"❌ 处理图片时发生未知错误: {e}", level="ERROR", target_tab="Telegram")
+            # 发生未知错误，不标记为已读，下次重启会重新尝试
 
     def start_polling_thread(self):
         self.running = True
@@ -291,9 +315,29 @@ class TelegramBot:
         while self.running:
             try:
                 updates = self.bot.get_updates(offset=self.last_update_id + 1, timeout=10)  # 短超时，快速响应停止
+                
+                # 检查是否有撤回消息
                 for update in updates:
-                    self.bot.process_new_updates([update])
-                    self.last_update_id = update.update_id
+                    # 如果有编辑消息（可能是撤回）或者消息已经被删除
+                    if hasattr(update, 'edited_message') and update.edited_message:
+                        # 这是被撤回的消息，跳过处理
+                        self.log_queue.put(f"⚠️ 检测到撤回消息，已忽略。", target_tab="Telegram")
+                        continue
+                    if hasattr(update, 'message') and update.message:
+                        # 检查消息是否有效（未被撤回）
+                        if hasattr(update.message, 'edit_date') and update.message.edit_date:
+                            # 消息被修改过，可能是撤回
+                            self.log_queue.put(f"⚠️ 检测到修改后的消息，可能已撤回，跳过处理。", target_tab="Telegram")
+                            continue
+                        # 正常处理消息
+                        self.bot.process_new_updates([update])
+                        self.last_update_id = update.update_id
+                    elif hasattr(update, 'channel_post') and update.channel_post:
+                        # 频道消息也需要处理
+                        if hasattr(update.channel_post, 'edit_date') and update.channel_post.edit_date:
+                            continue
+                        self.bot.process_new_updates([update])
+                        self.last_update_id = update.update_id
 
                 if self.running:  # 检查是否在处理过程中被要求停止
                     time_to_sleep = self.polling_interval_minutes * 60
@@ -837,6 +881,45 @@ class MDACApp:
             return
         self.excel_manager = ExcelManager(excel_path)
         self.telegram_bot = TelegramBot(token, self.excel_manager, self.mrz_parser, log_queue)
+        
+        # 修改点：每次启动监听时，同步所有已处理成功的消息
+        try:
+            # 获取所有未读消息
+            updates = self.telegram_bot.bot.get_updates()
+            for update in updates:
+                if update.message and update.message.photo:
+                    # 尝试解析这张旧照片
+                    img_bytes = io.BytesIO(self.telegram_bot.bot.download_file(self.telegram_bot.bot.get_file(update.message.photo[-1].file_id).file_path))
+                    success, result = self.telegram_bot.mrz_parser.parse_image(img_bytes)
+                    
+                    if success:
+                        # 如果解析成功，且Excel里没有这个护照号，说明之前漏掉了
+                        if not self.telegram_bot.excel_manager.check_duplicate(result['passport']):
+                            self.telegram_bot.log_queue.put(f"发现漏掉的旧照片 (护照号: {result['passport']})，正在补录...", target_tab="Telegram")
+                            row = self.telegram_bot.excel_manager.append_customer(result)
+                            if row:
+                                self.telegram_bot.log_queue.put(f"✅ 补录成功！姓名: {result['name']} 已写入 Excel 第 {row} 行。", target_tab="Telegram")
+                                self.telegram_bot.last_update_id = update.update_id
+                                continue
+                        else:
+                            # 如果Excel里已经有了，说明已经处理过了，标记为已读
+                            self.telegram_bot.last_update_id = update.update_id
+                            continue
+                    
+                    # 如果解析失败或者补录失败，保留旧的 update_id 以便下次再试
+                    # 我们不需要做特殊处理，只要不更新 last_update_id 就行
+                    
+                elif update.message:
+                    # 非照片消息，直接标记为已读
+                    self.telegram_bot.last_update_id = update.update_id
+                elif update.edited_message:
+                    # 撤回的消息，直接标记为已读
+                    self.telegram_bot.last_update_id = update.update_id
+                    
+            self.telegram_bot.log_queue.put(f"✅ 历史消息状态已同步完毕。", target_tab="Telegram")
+        except Exception as e:
+            self.telegram_bot.log_queue.put(f"⚠️ 同步最新状态失败: {e}", level="WARNING", target_tab="Telegram")
+            
         self.telegram_bot.set_polling_interval(int(self.telegram_interval_var.get()))
         self.is_telegram_running = True
         self.start_telegram_btn.config(state=tk.DISABLED)
