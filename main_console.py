@@ -1,3 +1,5 @@
+import imaplib
+import email
 import re
 import base64
 import random
