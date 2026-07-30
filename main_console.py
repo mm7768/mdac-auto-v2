@@ -24,13 +24,13 @@ from filelock import FileLock
 
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 CONFIG_FILE = "../dist/text/mdac_settings.json"
+PROCESSED_EMAILS_FILE = "../dist/text/processed_emails.txt"  # 记录已处理的邮件ID
 
 def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath("../dist/text")
-
     return os.path.join(base_path, relative_path)
 
 # ==========================================
@@ -49,9 +49,7 @@ class LogQueue:
     def empty(self):
         return self.queue.empty()
 
-
 log_queue = LogQueue()
-
 
 # ==========================================
 # 1. 并发模块 (FileLock 封装 Excel 读写)
@@ -59,18 +57,18 @@ log_queue = LogQueue()
 class ExcelManager:
     def __init__(self, file_path):
         self.file_path = file_path
-        self.lock = FileLock(f"{file_path}.lock", timeout=30)  # 增加超时时间
+        self.lock = FileLock(f"{file_path}.lock", timeout=30)
 
     def append_customer(self, customer_data):
         try:
             with self.lock:
                 wb = load_workbook(self.file_path)
                 sheet = wb.active
-                
-                # 寻找第一个真正的空行（B列到L列都为空，忽略A列的数字）
+
+                # 寻找第一个真正的空行（A列到L列全部为空）
                 row = 2  # 从第2行开始，跳过表头
                 while row <= sheet.max_row:
-                    if all(sheet.cell(row=row, column=c).value is None for c in range(2, 13)):
+                    if all(sheet.cell(row=row, column=c).value is None for c in range(1, 13)):
                         break  # 找到了空行
                     row += 1
                 # 如果都没找到空行，就在最后追加
@@ -78,7 +76,8 @@ class ExcelManager:
                     row = sheet.max_row + 1
 
                 def format_date_to_str(dt):
-                    if not dt: return ""
+                    if not dt:
+                        return ""
                     return f"{dt.day}-{dt.strftime('%b-%y')}"
 
                 sheet[f"A{row}"] = customer_data['name']
@@ -122,9 +121,37 @@ class ExcelManager:
             log_queue.put(f"❌ Excel 查重失败: {e}", level="ERROR", target_tab="Telegram")
             return False
 
+    # ==========================================
+    # Tab 3 专用：按护照号查找并写入 PIN 码
+    # ==========================================
+    def update_pin_by_passport(self, passport, pin):
+        """
+        在 Excel B 列查找护照号，找到后写入 PIN 到 H 列，
+        并将 I 列状态改为 COMPLETED，J 列更新时间戳。
+        返回: True=找到并写入, False=未找到
+        """
+        try:
+            with self.lock:
+                wb = load_workbook(self.file_path)
+                sheet = wb.active
+                passport_upper = passport.strip().upper()
+
+                for row in range(2, sheet.max_row + 1):
+                    cell_val = sheet[f"B{row}"].value
+                    if cell_val and str(cell_val).strip().upper() == passport_upper:
+                        sheet[f"H{row}"] = pin              # H列写入 PIN
+                        sheet[f"I{row}"] = "COMPLETED"      # I列更新状态
+                        sheet[f"J{row}"] = datetime.now()    # J列更新时间戳
+                        wb.save(self.file_path)
+                        return True
+                return False
+        except Exception as e:
+            log_queue.put(f"❌ Excel 写入 PIN 失败: {e}", level="ERROR", target_tab="Gmail")
+            return False
+
 
 # ==========================================
-# 2. OCR 与 MRZ 解析模块
+# 2. OCR 与 MRZ 解析模块 (保持不变)
 # ==========================================
 class MRZParser:
     def __init__(self):
@@ -153,7 +180,7 @@ class MRZParser:
                 if '人' in line[1]:
                     line[1] = line[1].replace('人', '<')
                 cleaned_result.append(line)
-                
+
             lines = [line[1].replace(" ", "").upper() for line in cleaned_result]
             potential_mrz = [l for l in lines if '<' in l and len(l) > 20]
 
@@ -213,7 +240,7 @@ class MRZParser:
 
 
 # ==========================================
-# 3. Telegram 监听模块
+# 3. Telegram 监听模块 (保持不变)
 # ==========================================
 class TelegramBot:
     def __init__(self, token, excel_manager, mrz_parser, log_queue):
@@ -280,15 +307,14 @@ class TelegramBot:
                     row = self.excel_manager.append_customer(result)
                     if row:
                         self.safe_reply(message,
-                                          f"✅ 识别成功！姓名: {result['name']}, 护照号: {result['passport']}. 已写入 Excel 第 {row} 行。请在 Excel 中补充日期并将状态改为 PENDING。")
+                                        f"✅ 识别成功！姓名: {result['name']}, 护照号: {result['passport']}. 已写入 Excel 第 {row} 行。请在 Excel 中补充日期并将状态改为 PENDING。")
                         self.log_queue.put(
                             f"✅ 识别成功！姓名: {result['name']}, 护照号: {result['passport']}. 已写入 Excel 第 {row} 行。",
                             target_tab="Telegram")
                         # 修改点：写入成功，标记为已读
                         self.last_update_id = message.message_id
                     else:
-                        self.safe_reply(message,
-                                          f"❌ 识别成功但写入 Excel 失败。")
+                        self.safe_reply(message, f"❌ 识别成功但写入 Excel 失败。")
                         self.log_queue.put(f"❌ 识别成功但写入 Excel 失败。", level="ERROR", target_tab="Telegram")
                         # 写入失败，不标记为已读，下次重启会重新尝试
             else:
@@ -315,7 +341,7 @@ class TelegramBot:
         while self.running:
             try:
                 updates = self.bot.get_updates(offset=self.last_update_id + 1, timeout=10)  # 短超时，快速响应停止
-                
+
                 # 检查是否有撤回消息
                 for update in updates:
                     # 如果有编辑消息（可能是撤回）或者消息已经被删除
@@ -625,7 +651,260 @@ def process_registration(page, excel_manager, row, customer, config, log_func):
 
 
 # ==========================================
-# 5. GUI 界面类
+# 5. 新增：Gmail PIN 码自动获取模块 (Tab 3)
+# ==========================================
+class GmailPINFetcher:
+    """
+    定时从 Gmail 读取 mdac@imi.gov.my 发来的邮件，
+    提取姓名、护照号、PIN 码，写入 Excel 或通过 Telegram 报警。
+    """
+
+    # 目标发件人（MDAC 官方）
+    SENDER_FILTER = "mdac@imi.gov.my"
+
+    def __init__(self, email_addr, app_password, excel_manager, telegram_token, chat_id,
+                 interval_minutes, log_queue):
+        self.email_addr = email_addr
+        self.app_password = app_password
+        self.excel_manager = excel_manager
+        self.telegram_token = telegram_token
+        self.chat_id = chat_id
+        self.interval_minutes = max(1, interval_minutes)
+        self.log_queue = log_queue
+        self.running = False
+
+    # ------------------------------------------------------------------
+    # 本地记录：处理过的邮件 Message-ID
+    # ------------------------------------------------------------------
+    def _load_processed_ids(self):
+        """从本地文件加载已处理的邮件 ID 集合"""
+        try:
+            if os.path.exists(PROCESSED_EMAILS_FILE):
+                with open(PROCESSED_EMAILS_FILE, "r", encoding="utf-8") as f:
+                    return set(line.strip() for line in f if line.strip())
+        except Exception as e:
+            self.log_queue.put(f"⚠️ 读取 processed_emails.txt 失败: {e}", level="WARNING", target_tab="Gmail")
+        return set()
+
+    def _save_processed_ids(self, processed_set):
+        """将已处理的邮件 ID 写回本地文件"""
+        try:
+            os.makedirs(os.path.dirname(PROCESSED_EMAILS_FILE), exist_ok=True)
+            with open(PROCESSED_EMAILS_FILE, "w", encoding="utf-8") as f:
+                for mid in processed_set:
+                    f.write(mid + "\n")
+        except Exception as e:
+            self.log_queue.put(f"⚠️ 保存 processed_emails.txt 失败: {e}", level="WARNING", target_tab="Gmail")
+
+    # ------------------------------------------------------------------
+    # 邮件解析
+    # ------------------------------------------------------------------
+    def _parse_email_body(self, msg):
+        """从邮件中提取纯文本正文"""
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                content_disposition = str(part.get("Content-Disposition", ""))
+                # 跳过附件
+                if "attachment" in content_disposition:
+                    continue
+                if content_type == "text/plain":
+                    charset = part.get_content_charset() or "utf-8"
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        body += payload.decode(charset, errors="ignore")
+                elif content_type == "text/html":
+                    # 尝试获取纯文本版本，没有则从 HTML 提取
+                    charset = part.get_content_charset() or "utf-8"
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        html_text = payload.decode(charset, errors="ignore")
+                        # 简单去标签，只保留文字内容
+                        import re as _re
+                        body += _re.sub(r'<[^>]+>', ' ', html_text)
+        else:
+            charset = msg.get_content_charset() or "utf-8"
+            payload = msg.get_payload(decode=True)
+            if payload:
+                body = payload.decode(charset, errors="ignore")
+        return body
+
+    def _extract_fields(self, body):
+        """
+        从邮件正文提取姓名、护照号、PIN 码。
+        返回 dict，缺字段则对应值为 None。
+        """
+        name = None
+        passport = None
+        pin = None
+
+        # Name : TANG FUMING
+        m = re.search(r"Name\s*:\s*(.+?)(?:\r?\n|$)", body)
+        if m:
+            name = m.group(1).strip()
+
+        # Passport No. : EJ1660876
+        m = re.search(r"Passport\s+No\.\s*:\s*([A-Za-z0-9]+)", body)
+        if m:
+            passport = m.group(1).strip()
+
+        # PIN : 8pczkJDr  (在 "Thank you" 之前，PIN 单独加粗显示)
+        m = re.search(r"\bPIN\s*:\s*([A-Za-z0-9]+)", body)
+        if m:
+            pin = m.group(1).strip()
+
+        return {"name": name, "passport": passport, "pin": pin}
+
+    # ------------------------------------------------------------------
+    # Telegram 报警
+    # ------------------------------------------------------------------
+    def _send_telegram_alert(self, name, passport, pin):
+        """找不到护照号时通过 Telegram 推送报警"""
+        if not self.telegram_token or not self.chat_id:
+            self.log_queue.put("⚠️ Telegram Token 或 Chat ID 未配置，无法发送报警。", level="WARNING", target_tab="Gmail")
+            return
+        try:
+            bot = telebot.TeleBot(self.telegram_token)
+            text = (
+                f"⚠️ **PIN码匹配失败（Excel 找不到护照号）**\n\n"
+                f"客户名字：{name}\n"
+                f"护照号：{passport}\n"
+                f"PIN码：{pin}\n\n"
+                f"请手动核查 Excel 文件。"
+            )
+            bot.send_message(self.chat_id, text, parse_mode="Markdown")
+            self.log_queue.put(f"📨 Telegram 报警已发送: 护照号 {passport}", target_tab="Gmail")
+        except Exception as e:
+            self.log_queue.put(f"❌ Telegram 报警发送失败: {e}", level="ERROR", target_tab="Gmail")
+
+    # ------------------------------------------------------------------
+    # 单次执行：连接 Gmail → 提取 → 写入/报警
+    # ------------------------------------------------------------------
+    def _fetch_once(self):
+        """执行一轮 Gmail 检查"""
+        self.log_queue.put(f"[Gmail] 开始连接 Gmail 检查新邮件...", target_tab="Gmail")
+
+        processed_ids = self._load_processed_ids()
+
+        try:
+            mail = imaplib.IMAP4_SSL("imap.gmail.com")
+            mail.login(self.email_addr, self.app_password)
+            mail.select("inbox")
+
+            # 搜索来自 MDAC 的所有邮件（不分已读未读）
+            status, messages = mail.search(None, f'(FROM "{self.SENDER_FILTER}")')
+            if status != "OK":
+                self.log_queue.put("⚠️ IMAP 搜索失败。", level="WARNING", target_tab="Gmail")
+                mail.logout()
+                return
+
+            email_ids = messages[0].split()
+            self.log_queue.put(f"[Gmail] 共找到 {len(email_ids)} 封来自 {self.SENDER_FILTER} 的邮件", target_tab="Gmail")
+
+            new_count = 0
+            for e_id in email_ids:
+                # 获取 Message-ID 用于去重
+                res, header_data = mail.fetch(e_id, "(BODY[HEADER.FIELDS (MESSAGE-ID)])")
+                header_text = header_data[0][1].decode("utf-8", errors="ignore")
+                msg_id_match = re.search(r"Message-ID:\s*<(.+?)>", header_text)
+                if not msg_id_match:
+                    continue
+                message_id = msg_id_match.group(1).strip()
+
+                # 跳过已处理
+                if message_id in processed_ids:
+                    continue
+
+                # 获取完整邮件
+                res, msg_data = mail.fetch(e_id, "(RFC822)")
+                raw_email = msg_data[0][1]
+                msg = email.message_from_bytes(raw_email)
+
+                # 解析正文
+                body = self._parse_email_body(msg)
+                fields = self._extract_fields(body)
+
+                if not fields["pin"]:
+                    self.log_queue.put(f"⚠️ 邮件 Message-ID={message_id} 未找到 PIN 码，跳过。", level="WARNING", target_tab="Gmail")
+                    processed_ids.add(message_id)  # 即使没 PIN 也标记已处理，避免无限重试
+                    continue
+
+                new_count += 1
+                self.log_queue.put(
+                    f"[Gmail] 提取到新邮件: 姓名={fields['name']}, 护照号={fields['passport']}, PIN={fields['pin']}",
+                    target_tab="Gmail"
+                )
+
+                # 在 Excel 中查找护照号
+                passport = fields["passport"]
+                if passport:
+                    found = self.excel_manager.update_pin_by_passport(passport, fields["pin"])
+                    if found:
+                        self.log_queue.put(
+                            f"✅ 成功写入 PIN: {fields['name']} ({passport}) → {fields['pin']}",
+                            target_tab="Gmail"
+                        )
+                        processed_ids.add(message_id)
+                    else:
+                        self.log_queue.put(
+                            f"❌ 护照号 {passport} 在 Excel 中未找到，触发 Telegram 报警",
+                            level="ERROR", target_tab="Gmail"
+                        )
+                        self._send_telegram_alert(
+                            fields.get("name", "未知"),
+                            passport,
+                            fields["pin"]
+                        )
+                        # 不标记为已处理，下一轮会重试
+                else:
+                    self.log_queue.put(f"⚠️ 邮件未提取到护照号，跳过: Message-ID={message_id}", level="WARNING", target_tab="Gmail")
+                    processed_ids.add(message_id)
+
+            self._save_processed_ids(processed_ids)
+
+            if new_count == 0:
+                self.log_queue.put(f"[Gmail] 本轮无新邮件，等待 {self.interval_minutes} 分钟后重试...", target_tab="Gmail")
+
+            mail.logout()
+
+        except imaplib.IMAP4.error as e:
+            self.log_queue.put(f"❌ Gmail 登录失败: {e}，请检查邮箱和密码。", level="ERROR", target_tab="Gmail")
+        except Exception as e:
+            self.log_queue.put(f"❌ Gmail 检查发生错误: {e}", level="ERROR", target_tab="Gmail")
+
+    # ------------------------------------------------------------------
+    # 线程控制
+    # ------------------------------------------------------------------
+    def start(self):
+        """启动后台循环线程"""
+        self.running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        self.log_queue.put(
+            f"Gmail PIN 获取线程已启动，每 {self.interval_minutes} 分钟检查一次。",
+            target_tab="Gmail"
+        )
+
+    def stop(self):
+        """停止后台循环线程"""
+        self.running = False
+        self.log_queue.put("Gmail PIN 获取线程正在停止...", target_tab="Gmail")
+
+    def _run_loop(self):
+        """主循环：定时执行 fetch_once"""
+        while self.running:
+            self._fetch_once()
+            # 可中断的等待
+            for i in range(self.interval_minutes * 60):
+                if not self.running:
+                    break
+                time.sleep(1)
+        self.log_queue.put("Gmail PIN 获取线程已停止。", target_tab="Gmail")
+
+
+# ==========================================
+# 6. GUI 界面类
 # ==========================================
 class MDACApp:
     def __init__(self, root):
@@ -652,6 +931,10 @@ class MDACApp:
         self.is_telegram_running = False
         self.telegram_thread = None
 
+        # Tab 3 状态
+        self.is_gmail_running = False
+        self.gmail_fetcher = None
+
         self.create_widgets()
         self.process_log_queue()
 
@@ -665,7 +948,11 @@ class MDACApp:
         return {
             "excel_path": "", "email": "", "phone": "", "vessel": "",
             "address1": "", "address2": "", "postcode": "", "test_mode": True,
-            "telegram_token": "", "telegram_interval": 60
+            "telegram_token": "", "telegram_interval": 60,
+            # Tab 3 Gmail 配置
+            "gmail_address": "", "gmail_app_password": "",
+            "gmail_interval": 10,
+            "gmail_telegram_token": "", "gmail_chat_id": "",
         }
 
     def save_config(self):
@@ -679,7 +966,13 @@ class MDACApp:
             "postcode": self.postcode_var.get(),
             "test_mode": self.test_mode_var.get(),
             "telegram_token": self.telegram_token_var.get(),
-            "telegram_interval": int(self.telegram_interval_var.get())
+            "telegram_interval": int(self.telegram_interval_var.get()) if self.telegram_interval_var.get() else 60,
+            # Tab 3 Gmail 配置
+            "gmail_address": self.gmail_address_var.get(),
+            "gmail_app_password": self.gmail_app_password_var.get(),
+            "gmail_interval": int(self.gmail_interval_var.get()) if self.gmail_interval_var.get() else 10,
+            "gmail_telegram_token": self.gmail_telegram_token_var.get(),
+            "gmail_chat_id": self.gmail_chat_id_var.get(),
         }
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -762,7 +1055,7 @@ class MDACApp:
                                                                                               pady=2)
 
         ttk.Label(telegram_config_frame, text="监听间隔 (分钟):").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.telegram_interval_var = tk.StringVar(value=self.config.get("telegram_interval", 60))
+        self.telegram_interval_var = tk.StringVar(value=str(self.config.get("telegram_interval", 60)))
         ttk.Entry(telegram_config_frame, textvariable=self.telegram_interval_var, width=10).grid(row=1, column=1,
                                                                                                  sticky=tk.W, padx=10,
                                                                                                  pady=2)
@@ -784,6 +1077,74 @@ class MDACApp:
                                                               font=("微软雅黑", 9))
         self.telegram_log_text.pack(fill="both", expand=True)
 
+        # ============================================================
+        # Tab 3: Gmail PIN 码自动获取（新增）
+        # ============================================================
+        self.gmail_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.gmail_tab, text="Gmail PIN 获取")
+
+        gmail_config_frame = ttk.LabelFrame(self.gmail_tab, text=" Gmail 读取设置 ", padding=15)
+        gmail_config_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
+
+        # Row 0: Gmail 账号
+        ttk.Label(gmail_config_frame, text="Gmail 账号:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.gmail_address_var = tk.StringVar(value=self.config.get("gmail_address", ""))
+        ttk.Entry(gmail_config_frame, textvariable=self.gmail_address_var, width=40).grid(
+            row=0, column=1, sticky=tk.W, padx=10, pady=2)
+
+        # Row 1: Google 16位应用专用密码
+        ttk.Label(gmail_config_frame, text="Google 应用专用密码:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.gmail_app_password_var = tk.StringVar(value=self.config.get("gmail_app_password", ""))
+        password_entry = ttk.Entry(gmail_config_frame, textvariable=self.gmail_app_password_var, width=40, show="*")
+        password_entry.grid(row=1, column=1, sticky=tk.W, padx=10, pady=2)
+
+        # 显示/隐藏密码按钮
+        self.show_gmail_pw_var = tk.BooleanVar(value=False)
+        show_pw_btn = ttk.Checkbutton(
+            gmail_config_frame, text="显示密码", variable=self.show_gmail_pw_var,
+            command=lambda: password_entry.configure(show="" if self.show_gmail_pw_var.get() else "*")
+        )
+        show_pw_btn.grid(row=1, column=2, sticky=tk.W, padx=5, pady=2)
+
+        # Row 2: 检查间隔
+        ttk.Label(gmail_config_frame, text="检查间隔 (分钟):").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.gmail_interval_var = tk.StringVar(value=str(self.config.get("gmail_interval", 10)))
+        ttk.Entry(gmail_config_frame, textvariable=self.gmail_interval_var, width=10).grid(
+            row=2, column=1, sticky=tk.W, padx=10, pady=2)
+
+        # Row 3: Telegram Bot Token (用于报警)
+        ttk.Label(gmail_config_frame, text="报警 Bot Token:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.gmail_telegram_token_var = tk.StringVar(value=self.config.get("gmail_telegram_token", ""))
+        ttk.Entry(gmail_config_frame, textvariable=self.gmail_telegram_token_var, width=50).grid(
+            row=3, column=1, sticky=tk.W, padx=10, pady=2)
+
+        # Row 4: Telegram Chat ID
+        ttk.Label(gmail_config_frame, text="报警接收 Chat ID:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        self.gmail_chat_id_var = tk.StringVar(value=self.config.get("gmail_chat_id", ""))
+        ttk.Entry(gmail_config_frame, textvariable=self.gmail_chat_id_var, width=50).grid(
+            row=4, column=1, sticky=tk.W, padx=10, pady=2)
+
+        # 按钮区
+        gmail_button_frame = ttk.Frame(self.gmail_tab)
+        gmail_button_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
+
+        self.start_gmail_btn = ttk.Button(gmail_button_frame, text="启动 Gmail 检查", command=self.start_gmail_fetcher)
+        self.start_gmail_btn.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.stop_gmail_btn = ttk.Button(gmail_button_frame, text="停止 Gmail 检查",
+                                         command=self.stop_gmail_fetcher, state=tk.DISABLED)
+        self.stop_gmail_btn.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.save_gmail_config_btn = ttk.Button(gmail_button_frame, text="保存配置", command=self.save_config)
+        self.save_gmail_config_btn.pack(side=tk.RIGHT, padx=5, pady=5)
+
+        # 日志区
+        gmail_log_frame = ttk.LabelFrame(self.gmail_tab, text=" Gmail 运行日志 ", padding=10)
+        gmail_log_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        self.gmail_log_text = scrolledtext.ScrolledText(gmail_log_frame, wrap=tk.WORD, height=15,
+                                                         font=("微软雅黑", 9))
+        self.gmail_log_text.pack(fill="both", expand=True)
+
     def browse_excel_file(self, var):
         file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
         if file_path:
@@ -791,9 +1152,22 @@ class MDACApp:
             self.save_config()
 
     def process_log_queue(self):
+        """
+        日志分发：三路分发到对应 Tab 的日志框
+        target_tab: "MDAC" → MDAC框 | "Telegram" → Telegram框 | "Gmail" → Gmail框
+        其他 → 默认进 MDAC 框（保留旧行为）
+        """
         while not log_queue.empty():
             message, level, target_tab = log_queue.get()
-            txt = self.mdac_log_text if target_tab == "MDAC" else self.telegram_log_text
+            if target_tab == "MDAC":
+                txt = self.mdac_log_text
+            elif target_tab == "Telegram":
+                txt = self.telegram_log_text
+            elif target_tab == "Gmail":
+                txt = self.gmail_log_text
+            else:
+                txt = self.mdac_log_text  # 默认
+
             txt.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n")
             txt.see(tk.END)
         self.root.after(100, self.process_log_queue)
@@ -881,7 +1255,7 @@ class MDACApp:
             return
         self.excel_manager = ExcelManager(excel_path)
         self.telegram_bot = TelegramBot(token, self.excel_manager, self.mrz_parser, log_queue)
-        
+
         # 修改点：每次启动监听时，同步所有已处理成功的消息
         try:
             # 获取所有未读消息
@@ -889,37 +1263,40 @@ class MDACApp:
             for update in updates:
                 if update.message and update.message.photo:
                     # 尝试解析这张旧照片
-                    img_bytes = io.BytesIO(self.telegram_bot.bot.download_file(self.telegram_bot.bot.get_file(update.message.photo[-1].file_id).file_path))
+                    img_bytes = io.BytesIO(self.telegram_bot.bot.download_file(
+                        self.telegram_bot.bot.get_file(update.message.photo[-1].file_id).file_path))
                     success, result = self.telegram_bot.mrz_parser.parse_image(img_bytes)
-                    
+
                     if success:
                         # 如果解析成功，且Excel里没有这个护照号，说明之前漏掉了
                         if not self.telegram_bot.excel_manager.check_duplicate(result['passport']):
-                            self.telegram_bot.log_queue.put(f"发现漏掉的旧照片 (护照号: {result['passport']})，正在补录...", target_tab="Telegram")
+                            self.telegram_bot.log_queue.put(
+                                f"发现漏掉的旧照片 (护照号: {result['passport']})，正在补录...", target_tab="Telegram")
                             row = self.telegram_bot.excel_manager.append_customer(result)
                             if row:
-                                self.telegram_bot.log_queue.put(f"✅ 补录成功！姓名: {result['name']} 已写入 Excel 第 {row} 行。", target_tab="Telegram")
+                                self.telegram_bot.log_queue.put(
+                                    f"✅ 补录成功！姓名: {result['name']} 已写入 Excel 第 {row} 行。", target_tab="Telegram")
                                 self.telegram_bot.last_update_id = update.update_id
                                 continue
                         else:
                             # 如果Excel里已经有了，说明已经处理过了，标记为已读
                             self.telegram_bot.last_update_id = update.update_id
                             continue
-                    
+
                     # 如果解析失败或者补录失败，保留旧的 update_id 以便下次再试
                     # 我们不需要做特殊处理，只要不更新 last_update_id 就行
-                    
+
                 elif update.message:
                     # 非照片消息，直接标记为已读
                     self.telegram_bot.last_update_id = update.update_id
                 elif update.edited_message:
                     # 撤回的消息，直接标记为已读
                     self.telegram_bot.last_update_id = update.update_id
-                    
+
             self.telegram_bot.log_queue.put(f"✅ 历史消息状态已同步完毕。", target_tab="Telegram")
         except Exception as e:
             self.telegram_bot.log_queue.put(f"⚠️ 同步最新状态失败: {e}", level="WARNING", target_tab="Telegram")
-            
+
         self.telegram_bot.set_polling_interval(int(self.telegram_interval_var.get()))
         self.is_telegram_running = True
         self.start_telegram_btn.config(state=tk.DISABLED)
@@ -932,6 +1309,65 @@ class MDACApp:
         self.is_telegram_running = False
         self.start_telegram_btn.config(state=tk.NORMAL)
         self.stop_telegram_btn.config(state=tk.DISABLED)
+
+    # ================================================================
+    # Tab 3: Gmail PIN 码获取 启动 / 停止
+    # ================================================================
+    def start_gmail_fetcher(self):
+        """校验配置后启动 Gmail PIN 获取"""
+        excel_path = self.excel_var.get()
+        gmail_addr = self.gmail_address_var.get().strip()
+        gmail_pw = self.gmail_app_password_var.get().strip()
+        telegram_token = self.gmail_telegram_token_var.get().strip()
+        chat_id = self.gmail_chat_id_var.get().strip()
+
+        # 校验必填项
+        if not gmail_addr:
+            messagebox.showerror("错误", "请填写 Gmail 账号！")
+            return
+        if not gmail_pw:
+            messagebox.showerror("错误", "请填写 Google 应用专用密码！")
+            return
+        if not os.path.exists(excel_path):
+            messagebox.showerror("错误", "请选择有效的 Excel 文件路径！")
+            return
+
+        # 间隔校验
+        try:
+            interval = int(self.gmail_interval_var.get())
+            if interval < 1:
+                interval = 1
+        except ValueError:
+            interval = 10
+            self.gmail_interval_var.set("10")
+
+        # 创建 ExcelManager（如果还没创建）
+        if self.excel_manager is None or self.excel_manager.file_path != excel_path:
+            self.excel_manager = ExcelManager(excel_path)
+
+        # 创建 GmailPINFetcher
+        self.gmail_fetcher = GmailPINFetcher(
+            email_addr=gmail_addr,
+            app_password=gmail_pw,
+            excel_manager=self.excel_manager,
+            telegram_token=telegram_token,
+            chat_id=chat_id,
+            interval_minutes=interval,
+            log_queue=log_queue,
+        )
+
+        self.is_gmail_running = True
+        self.start_gmail_btn.config(state=tk.DISABLED)
+        self.stop_gmail_btn.config(state=tk.NORMAL)
+        self.gmail_fetcher.start()
+
+    def stop_gmail_fetcher(self):
+        """停止 Gmail PIN 获取"""
+        if self.gmail_fetcher:
+            self.gmail_fetcher.stop()
+        self.is_gmail_running = False
+        self.start_gmail_btn.config(state=tk.NORMAL)
+        self.stop_gmail_btn.config(state=tk.DISABLED)
 
 
 if __name__ == "__main__":
