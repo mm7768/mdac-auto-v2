@@ -4,13 +4,14 @@
 
 ## 🚀 核心功能
 
-*   **三标签页 UI 控制台**:
+*   **四标签页 UI 控制台**:
     *   **MDAC 控制页**: 一键启动自动化填表，实时监控 Excel 状态。
     *   **Telegram 监听页**: 开启机器人监听，自动从聊天中提取护照信息。
     *   **Gmail PIN 获取页**: 自动从 Gmail 收集移民局发送的 PIN 码并匹配回填。
+    *   **护照 PDF MRZ 页**: 使用独立 Telegram Bot 批量处理 PDF 每页护照，并回传进度、失败页和重复跳过页。
 *   **智能 Telegram 机器人**:
     *   自动接收用户发送的护照照片。
-    *   **内存 OCR**: 使用 RapidOCR 在内存中直接处理图片，不留本地缓存，保护隐私。
+    *   **内存 OCR**: 使用 PaddleOCR 在内存中直接处理图片，不留本地缓存，保护隐私。
     *   **MRZ 自动解析**: 自动提取护照号、姓名、国籍、出生日期及有效期。
 *   **Gmail 自动化 (NEW)**:
     *   **IMAP 实时监控**: 定时扫描来自 `mdac@imi.gov.my` 的邮件。
@@ -32,7 +33,7 @@
 2.  **Chrome 浏览器** (建议使用系统原生安装的 Chrome)
 3.  **依赖库安装**:
     ```bash
-    pip install playwright ddddocr rapidocr_onnxruntime pyTelegramBotAPI openpyxl filelock pillow
+    pip install playwright ddddocr pyTelegramBotAPI openpyxl filelock pillow pymupdf paddleocr paddlepaddle
     playwright install chromium
     ```
 
@@ -52,7 +53,8 @@
 3.  **采集信息**: 客户向机器人发送护照照片，机器人会自动解析并写入 Excel，状态标记为 `缺少日期`。
 4.  **手动确认**: 管理员在 Excel 中补全日期并将状态改为 `PENDING`。
 5.  **开始填表**: 在控制台点击“开始执行 MDAC”，程序将自动完成注册。
-6.  **自动收码**: 开启 "Gmail PIN 获取" 监听，脚本会自动抓取移民局发来的 PIN 码并填入 Excel H 列，状态自动更新为 `COMPLETED`。
+6.  **PDF 批处理**: 在 Tab 4 选择同格式 Excel、填写独立 Bot Token，启动后发送 PDF；程序逐页识别并回传进度，完成后返回失败页和重复跳过页。
+7.  **自动收码**: 开启 "Gmail PIN 获取" 监听，脚本会自动抓取移民局发来的 PIN 码并填入 Excel H 列，状态自动更新为 `COMPLETED`。
 
 ## ⚠️ 注意事项
 
