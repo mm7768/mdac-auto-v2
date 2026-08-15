@@ -72,11 +72,109 @@ log_queue = LogQueue()
 # 1. 并发模块 (FileLock 封装 Excel 读写)
 # ==========================================
 class ExcelManager:
-    def __init__(self, file_path):
+    def __init__(self, file_path, batch_mode=False, batch_size=10, batch_interval_seconds=30):
         self.file_path = file_path
         self.lock = FileLock(f"{file_path}.lock", timeout=30)
+        self.batch_mode = batch_mode
+        self.batch_size = max(1, batch_size)
+        self.batch_interval_seconds = max(1, batch_interval_seconds)
+        self._batch_lock = threading.RLock()
+        self._batch_flush_lock = threading.Lock()
+        self._pending_customers = []
+        self._pending_passports = set()
+        self._last_batch_flush = time.monotonic()
+
+    def queue_customer(self, customer_data, remark=None):
+        """将新增客户暂存到内存，达到数量或时间阈值后批量保存。"""
+        passport = str(customer_data.get("passport", "")).strip().upper()
+        with self._batch_lock:
+            if passport and passport in self._pending_passports:
+                return None
+            self._pending_customers.append((dict(customer_data), remark))
+            if passport:
+                self._pending_passports.add(passport)
+            should_flush = (
+                len(self._pending_customers) >= self.batch_size
+                or time.monotonic() - self._last_batch_flush >= self.batch_interval_seconds
+            )
+        if should_flush and not self.flush_pending():
+            return None
+        return True
+
+    def flush_pending(self):
+        """串行执行批量保存，避免停止线程与处理线程同时写入。"""
+        if not self._batch_flush_lock.acquire(blocking=False):
+            return True
+        try:
+            return self._flush_pending_impl()
+        finally:
+            self._batch_flush_lock.release()
+
+    def _flush_pending_impl(self):
+        """安全地将暂存记录一次性写入 Excel；失败时保留内存队列以便重试。"""
+        with self._batch_lock:
+            if not self._pending_customers:
+                return True
+            pending = list(self._pending_customers)
+
+        try:
+            with self.lock:
+                wb = load_workbook(self.file_path)
+                sheet = wb.active
+                existing_passports = {
+                    str(sheet[f"B{row}"].value).strip().upper()
+                    for row in range(2, sheet.max_row + 1)
+                    if sheet[f"B{row}"].value
+                }
+
+                for customer_data, remark in pending:
+                    passport = str(customer_data.get("passport", "")).strip().upper()
+                    if passport and passport in existing_passports:
+                        continue
+
+                    row = 2
+                    while row <= sheet.max_row:
+                        if all(sheet.cell(row=row, column=c).value is None for c in range(1, 13)):
+                            break
+                        row += 1
+                    if row > sheet.max_row:
+                        row = sheet.max_row + 1
+
+                    def format_date_to_str(dt):
+                        if not dt:
+                            return ""
+                        return f"{dt.day}-{dt.strftime('%b-%y')}"
+
+                    sheet[f"A{row}"] = customer_data["name"]
+                    sheet[f"B{row}"] = customer_data["passport"]
+                    sheet[f"C{row}"] = format_date_to_str(customer_data["dob"])
+                    sheet[f"D{row}"] = customer_data["sex_text"]
+                    sheet[f"E{row}"] = format_date_to_str(customer_data["passport_exp"])
+                    sheet[f"I{row}"] = "缺少日期"
+                    if remark is not None:
+                        sheet[f"K{row}"] = remark
+                    sheet[f"L{row}"] = customer_data["nationality"]
+                    if passport:
+                        existing_passports.add(passport)
+
+                wb.save(self.file_path)
+
+            with self._batch_lock:
+                del self._pending_customers[:len(pending)]
+                self._pending_passports = {
+                    str(data.get("passport", "")).strip().upper()
+                    for data, _ in self._pending_customers
+                    if data.get("passport")
+                }
+                self._last_batch_flush = time.monotonic()
+            return True
+        except Exception as e:
+            log_queue.put(f"❌ Excel 批量保存失败: {e}", level="ERROR", target_tab="PDF")
+            return False
 
     def append_customer(self, customer_data, remark=None):
+        if self.batch_mode:
+            return self.queue_customer(customer_data, remark)
         try:
             with self.lock:
                 wb = load_workbook(self.file_path)
@@ -127,6 +225,11 @@ class ExcelManager:
             log_queue.put(f"❌ Excel 状态更新失败 (行 {row}): {e}", level="ERROR", target_tab="MDAC")
 
     def check_duplicate(self, passport):
+        passport_key = str(passport or "").strip().upper()
+        if self.batch_mode:
+            with self._batch_lock:
+                if passport_key in self._pending_passports:
+                    return True
         try:
             with self.lock:
                 wb = load_workbook(self.file_path)
@@ -352,6 +455,8 @@ class TelegramBot:
             # 发生未知错误，不标记为已读，下次重启会重新尝试
 
     def start_polling_thread(self):
+        if self.running:
+            return
         self.running = True
         self._polling_thread = threading.Thread(target=self._long_polling, daemon=True)
         self._polling_thread.start()
@@ -360,12 +465,18 @@ class TelegramBot:
 
     def stop_polling_thread(self):
         self.running = False
+        polling_thread = getattr(self, "_polling_thread", None)
+        if polling_thread and polling_thread.is_alive() and polling_thread is not threading.current_thread():
+            polling_thread.join(timeout=70)
         self.log_queue.put("Telegram 监听线程正在停止...", target_tab="Telegram")
 
     def _long_polling(self):
         while self.running:
             try:
-                updates = self.bot.get_updates(offset=self.last_update_id + 1, timeout=10)  # 短超时，快速响应停止
+                updates = self.bot.get_updates(
+                    offset=self.last_update_id + 1,
+                    timeout=60,
+                )
 
                 # 检查是否有撤回消息
                 for update in updates:
@@ -482,6 +593,8 @@ class PDFMRZProcessor:
         self.progress_callback = progress_callback
         self.stop_requested = False
         self.processed_files = set()
+        self.progress_update_interval_seconds = 30
+        self._last_progress_update = 0.0
 
     def stop(self):
         self.stop_requested = True
@@ -532,6 +645,7 @@ class PDFMRZProcessor:
             total = len(pdf)
             progress_id = self._progress(message.chat.id, progress_id,
                 f"开始处理：{filename}\n总页数：{total}\n当前进度：0/{total}")
+            self._last_progress_update = time.monotonic()
             for index in range(total):
                 if self.stop_requested:
                     self._report("用户请求停止，当前 PDF 已中止。", "WARNING")
@@ -555,9 +669,18 @@ class PDFMRZProcessor:
                             success_count += 1
                         else:
                             failed_pages.append(page_no)
-                    progress_id = self._progress(message.chat.id, progress_id,
+                    progress_text = (
                         f"正在处理：{filename}\n总页数：{total}\n当前进度：{page_no}/{total}\n"
-                        f"识别成功：{success_count}\n失败：{len(failed_pages)}\n重复跳过：{len(duplicate_pages)}")
+                        f"识别成功：{success_count}\n失败：{len(failed_pages)}\n"
+                        f"重复跳过：{len(duplicate_pages)}"
+                    )
+                    now = time.monotonic()
+                    if (
+                        page_no == total
+                        or now - self._last_progress_update >= self.progress_update_interval_seconds
+                    ):
+                        progress_id = self._progress(message.chat.id, progress_id, progress_text)
+                        self._last_progress_update = now
                 except Exception as exc:
                     failed_pages.append(page_no)
                     self._report(f"第 {page_no} 页处理异常：{exc}", "ERROR")
@@ -568,6 +691,7 @@ class PDFMRZProcessor:
             self._report(f"PDF 处理失败：{exc}", "ERROR")
             self.bot.send_message(message.chat.id, f"❌ PDF 处理失败：{filename}\n原因：{exc}")
         finally:
+            self.excel_manager.flush_pending()
             if temp_path and temp_path.exists():
                 try:
                     temp_path.unlink()
@@ -604,28 +728,40 @@ class PDFTelegramBot:
             self.bot.send_message(message.chat.id, "Tab 4 只处理 PDF 文件。")
 
     def start(self):
+        if self.running:
+            return
         self.parser = PaddleMRZParser()
         self.processor = PDFMRZProcessor(self.bot, self.excel_manager, self.log_queue)
         self.running = True
-        threading.Thread(target=self._poll, daemon=True).start()
+        self._polling_thread = threading.Thread(target=self._poll, daemon=True)
+        self._polling_thread.start()
         self.log_queue.put("Tab 4 PDF Telegram Bot 已启动。", target_tab="PDF")
 
     def stop(self):
         self.running = False
         if self.processor:
             self.processor.stop()
+        polling_thread = getattr(self, "_polling_thread", None)
+        if polling_thread and polling_thread.is_alive() and polling_thread is not threading.current_thread():
+            polling_thread.join(timeout=70)
         self.log_queue.put("Tab 4 PDF Telegram Bot 正在停止。", target_tab="PDF")
 
     def _poll(self):
         while self.running:
             try:
-                updates = self.bot.get_updates(offset=self.last_update_id + 1, timeout=10)
+                updates = self.bot.get_updates(
+                    offset=self.last_update_id + 1,
+                    timeout=60,
+                )
                 for update in updates:
                     self.bot.process_new_updates([update])
                     self.last_update_id = update.update_id
             except Exception as exc:
                 self.log_queue.put(f"Tab 4 Telegram 错误：{exc}，10 秒后重试。", level="ERROR", target_tab="PDF")
-                time.sleep(10)
+                for _ in range(10):
+                    if not self.running:
+                        break
+                    time.sleep(1)
 
 # ==========================================
 # 4. 核心自动化逻辑 (完全保留用户原始微调逻辑)
@@ -1476,7 +1612,7 @@ class MDACApp:
             return
         self.save_config()
         try:
-            self.excel_manager = ExcelManager(excel_path)
+            self.excel_manager = ExcelManager(excel_path, batch_mode=True)
             self.pdf_bot = PDFTelegramBot(token, self.excel_manager, log_queue)
             self.pdf_bot.start()
             self.is_pdf_running = True
