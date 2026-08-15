@@ -56,6 +56,18 @@
 6.  **PDF 批处理**: 在 Tab 4 选择同格式 Excel、填写独立 Bot Token，启动后发送 PDF；程序逐页识别并回传进度，完成后返回失败页和重复跳过页。
 7.  **自动收码**: 开启 "Gmail PIN 获取" 监听，脚本会自动抓取移民局发来的 PIN 码并填入 Excel H 列，状态自动更新为 `COMPLETED`。
 
+## 🔍 MRZ OCR 模块
+
+MRZ 识别已独立拆分到 `mrz/` 包，Telegram 图片和 PDF 页面共用同一套 TD3 Passport 流程：预处理、多个 ROI/增强版本 OCR、两行重建、ICAO 7-3-1 校验位、字段感知 OCR 纠错和 confidence 评分。只有两行各 44 字符、五类 checksum 全部通过且 confidence 达到 90 分时，结果才会进入原有 Excel 写入流程；未通过时保持原有识别失败路径，不会自动写入 MDAC 数据。
+
+主要模块包括 `preprocess.py`、`ocr.py`、`parser.py`、`checksum.py`、`corrector.py`、`engine.py` 和 `legacy.py`。`legacy.py` 保留现有 `MRZParser.parse_image()` 返回协议，因此 Playwright、Excel、Telegram、PDF、Gmail 和 MDAC 提交流程无需改写。`personal_number` 会保留在结构化识别结果和诊断信息中，但当前不新增 Excel 列。
+
+运行 MRZ 回归测试：
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ## ⚠️ 注意事项
 
 *   **护照识别**: 请确保拍摄的护照照片清晰，尤其是底部的 MRZ 区域。

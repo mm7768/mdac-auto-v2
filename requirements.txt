@@ -7,3 +7,5 @@ pillow
 pymupdf
 paddleocr
 paddlepaddle
+opencv-python-headless
+numpy

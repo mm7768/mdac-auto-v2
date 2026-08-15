@@ -15,7 +15,6 @@ from tkinter import scrolledtext
 from datetime import datetime, timedelta
 from queue import Queue
 from pathlib import Path
-import numpy as np
 
 # 某些 CPU 环境下 PaddlePaddle oneDNN 会触发推理运行时兼容错误，默认关闭该路径。
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
@@ -26,11 +25,6 @@ try:
 except ImportError:
     fitz = None
 
-try:
-    from paddleocr import PaddleOCR
-except ImportError:
-    PaddleOCR = None
-
 import ddddocr
 from PIL import Image
 from openpyxl import load_workbook
@@ -38,6 +32,7 @@ from playwright.sync_api import sync_playwright
 
 import telebot
 from filelock import FileLock
+from mrz import MRZParser
 
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 CONFIG_FILE = "../dist/text/mdac_settings.json"
@@ -273,99 +268,10 @@ class ExcelManager:
 
 
 # ==========================================
-# 2. OCR 与 MRZ 解析模块 (保持不变)
+# 2. OCR 与 MRZ 解析模块
 # ==========================================
-class MRZParser:
-    def __init__(self):
-        # Tab 2 与 Tab 4 统一使用 PaddleOCR，首次识别时按需加载模型。
-        self.ocr = None
-
-    def _get_ocr(self):
-        if self.ocr is None:
-            self.ocr = _PaddleOCRAdapter()
-        return self.ocr
-
-    def correct_num(self, text):
-        # 纠正数字：O -> 0, I -> 1, L -> 1
-        return text.replace('O', '0').replace('I', '1').replace('L', '1')
-
-    def correct_alpha(self, text):
-        # 纠正字母：0 -> O, 1 -> I
-        return text.replace('0', 'O').replace('1', 'I')
-
-    def parse_image(self, img_bytes):
-        try:
-            img_data = img_bytes.getvalue() if hasattr(img_bytes, 'getvalue') else img_bytes
-            result, _ = self._get_ocr()(img_data)
-            if not result:
-                return False, "未识别到任何文字"
-
-            # 提取所有文本行，寻找包含 '<' 且长度接近 44 的行
-            # 修复竖版护照问题：将识别为"人"的字符替换回 '<'
-            cleaned_result = []
-            for line in result:
-                # 如果包含 '人'，很可能是竖版护照识别错误
-                if '人' in line[1]:
-                    line[1] = line[1].replace('人', '<')
-                cleaned_result.append(line)
-
-            lines = [line[1].replace(" ", "").upper() for line in cleaned_result]
-            potential_mrz = [l for l in lines if '<' in l and len(l) > 20]
-
-            if len(potential_mrz) < 2:
-                potential_mrz = [l for l in lines if len(l) > 35]
-                if len(potential_mrz) < 2:
-                    return False, f"未找到 MRZ (仅识别到 {len(potential_mrz)} 行疑似内容)"
-
-            potential_mrz.sort(key=len, reverse=True)
-            mrz_lines = potential_mrz[:2]
-            mrz_lines.sort(key=lambda x: 0 if x.startswith('P') else 1)
-
-            # 修正点 3：补齐长度。护照标准是 44 位，OCR 经常漏掉末尾的 <，我们手动补齐
-            line1 = mrz_lines[0].ljust(44, '<')
-            line2 = mrz_lines[1].ljust(44, '<')
-
-            # 1. 姓名 (Line 1)
-            name_part = line1[5:].split('<<')
-            last_name = self.correct_alpha(name_part[0].replace('<', ' ')).strip()
-            first_name = self.correct_alpha(name_part[1].replace('<', ' ')).strip() if len(name_part) > 1 else ""
-            full_name = f"{last_name} {first_name}".strip()
-
-            # 2. 护照号 (Line 2, 0-9)
-            passport = self.correct_num(line2[0:9].replace('<', ''))
-
-            # 3. 国籍 (Line 2, 10-13)
-            nationality = self.correct_alpha(line2[10:13].replace('<', ''))
-
-            # 4. 生日 (Line 2, 13-19)
-            dob_str = self.correct_num(line2[13:19])
-            year = int(dob_str[0:2])
-            # 如果年份大于当前年份后两位，说明是 19xx 年
-            current_yr = datetime.now().year % 100
-            full_year = (2000 + year) if year <= current_yr else (1900 + year)
-            dob = datetime(full_year, int(dob_str[2:4]), int(dob_str[4:6]))
-
-            # 5. 性别 (Line 2, 20)
-            sex_char = self.correct_alpha(line2[20])
-            sex_text = "男" if sex_char == 'M' else "女"
-
-            # 6. 过期日 (Line 2, 21-27)
-            exp_str = self.correct_num(line2[21:27])
-            exp_year = int(exp_str[0:2])
-            full_exp_year = 2000 + exp_year
-            passport_exp = datetime(full_exp_year, int(exp_str[2:4]), int(exp_str[4:6]))
-
-            return True, {
-                "name": full_name,
-                "passport": passport,
-                "nationality": nationality,
-                "dob": dob,
-                "sex_text": sex_text,
-                "passport_exp": passport_exp
-            }
-        except Exception as e:
-            return False, f"MRZ 解析失败: {str(e)}"
-
+# 实现已独立迁移到 mrz/ 包；这里保留 MRZParser 名称，
+# 由兼容门面为 Telegram/PDF 提供旧字段和 parse_image() 调用协议。
 
 # ==========================================
 # 3. Telegram 监听模块 (保持不变)
@@ -521,69 +427,7 @@ class TelegramBot:
 # ==========================================
 # 3B. Tab 4：PDF MRZ 批处理模块
 # ==========================================
-class _PaddleOCRAdapter:
-    """将不同版本 PaddleOCR 的输出统一成 MRZParser 所需的文本行格式。"""
-    def __init__(self):
-        if PaddleOCR is None:
-            raise RuntimeError("未安装 PaddleOCR，请先安装 paddleocr 与 paddlepaddle")
-        try:
-            self.engine = PaddleOCR(use_angle_cls=True, lang="en", enable_mkldnn=False)
-        except (TypeError, ValueError):
-            self.engine = PaddleOCR(lang="en", enable_mkldnn=False)
-
-    def _texts_from_item(self, item):
-        texts = []
-        if isinstance(item, dict):
-            for key in ("rec_texts", "texts", "text"):
-                value = item.get(key)
-                if isinstance(value, str):
-                    texts.append(value)
-                elif isinstance(value, (list, tuple)):
-                    texts.extend(str(x) for x in value)
-            for value in item.values():
-                if isinstance(value, dict):
-                    texts.extend(self._texts_from_item(value))
-        elif hasattr(item, "json"):
-            try:
-                data = item.json
-                if callable(data):
-                    data = data()
-                texts.extend(self._texts_from_item(data))
-            except Exception:
-                pass
-        elif isinstance(item, (list, tuple)):
-            if len(item) >= 2 and isinstance(item[1], str):
-                texts.append(item[1])
-            else:
-                for value in item:
-                    texts.extend(self._texts_from_item(value))
-        return texts
-
-    def __call__(self, image_bytes):
-        from PIL import Image as PILImage
-        image = PILImage.open(io.BytesIO(image_bytes)).convert("RGB")
-        try:
-            if hasattr(self.engine, "predict"):
-                raw = self.engine.predict(np.array(image))
-            else:
-                raw = self.engine.ocr(np.array(image), cls=True)
-        except (AttributeError, TypeError):
-            raw = self.engine.ocr(np.array(image), cls=True)
-        texts = self._texts_from_item(raw)
-        # 去重并保留顺序，统一为解析器所需的 [(box, text, score)] 结构。
-        seen = set()
-        lines = []
-        for text in texts:
-            text = str(text).strip()
-            if text and text not in seen:
-                seen.add(text)
-                lines.append([None, text, 1.0])
-        return lines, None
-
-
-class PaddleMRZParser(MRZParser):
-    pass
-
+# PDF 处理器复用 mrz.MRZParser，与 Telegram 图片链路使用同一套 TD3 OCR。
 
 class PDFMRZProcessor:
     def __init__(self, bot, excel_manager, log_queue, progress_callback=None):
@@ -730,7 +574,7 @@ class PDFTelegramBot:
     def start(self):
         if self.running:
             return
-        self.parser = PaddleMRZParser()
+        self.parser = MRZParser()
         self.processor = PDFMRZProcessor(self.bot, self.excel_manager, self.log_queue)
         self.running = True
         self._polling_thread = threading.Thread(target=self._poll, daemon=True)
