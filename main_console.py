@@ -695,6 +695,8 @@ def process_registration(page, excel_manager, row, customer, config, log_func):
         # =========================
         # 2. 填写个人资料
         # =========================
+        region = str(config.get("region", "60")).strip() or "60"
+        page.locator("#region").select_option(region)
         page.locator("#nationality").select_option(nationality)
         # 修改点：Place of Birth 跟着 Nationality
         page.locator("#pob").select_option(nationality)
@@ -718,10 +720,10 @@ def process_registration(page, excel_manager, row, customer, config, log_func):
         page.locator("#passNo").fill(passport)
 
         # 使用 JS 强制填入日期
-        dob_str = dob.strftime("%Y-%m-%d")
-        exp_str = passport_exp.strftime("%Y-%m-%d")
-        arrdt_str = arrdt.strftime("%Y-%m-%d")
-        depdt_str = depdt.strftime("%Y-%m-%d")
+        dob_str = dob.strftime("%d/%m/%Y")
+        exp_str = passport_exp.strftime("%d/%m/%Y")
+        arrdt_str = arrdt.strftime("%d/%m/%Y")
+        depdt_str = depdt.strftime("%d/%m/%Y")
 
         page.evaluate(f'''() => {{
             function setDateValue(id, value) {{
@@ -1176,7 +1178,7 @@ class MDACApp:
             except:
                 pass
         return {
-            "excel_path": "", "email": "", "phone": "", "vessel": "",
+            "excel_path": "", "email": "", "phone": "", "region": "60", "vessel": "",
             "address1": "", "address2": "", "postcode": "", "test_mode": True,
             "telegram_token": "", "telegram_interval": 60,
             # Tab 3 Gmail 配置
@@ -1191,6 +1193,7 @@ class MDACApp:
             "excel_path": self.excel_var.get(),
             "email": self.email_var.get(),
             "phone": self.phone_var.get(),
+            "region": self.region_var.get().strip() or "60",
             "vessel": self.vessel_var.get(),
             "address1": self.addr1_var.get(),
             "address2": self.addr2_var.get(),
@@ -1242,15 +1245,16 @@ class MDACApp:
         self.excel_var = add_mdac_config_row(mdac_config_frame, "Excel 文件路径:", "excel_path", 0, is_file=True)
         self.email_var = add_mdac_config_row(mdac_config_frame, "Email:", "email", 1)
         self.phone_var = add_mdac_config_row(mdac_config_frame, "手机号:", "phone", 2)
-        self.vessel_var = add_mdac_config_row(mdac_config_frame, "航班/船名:", "vessel", 3)
-        self.addr1_var = add_mdac_config_row(mdac_config_frame, "住宿地址1:", "address1", 4)
-        self.addr2_var = add_mdac_config_row(mdac_config_frame, "住宿地址2:", "address2", 5)
-        self.postcode_var = add_mdac_config_row(mdac_config_frame, "邮编:", "postcode", 6)
+        self.region_var = add_mdac_config_row(mdac_config_frame, "区域代码:", "region", 3)
+        self.vessel_var = add_mdac_config_row(mdac_config_frame, "航班/船名:", "vessel", 4)
+        self.addr1_var = add_mdac_config_row(mdac_config_frame, "住宿地址1:", "address1", 5)
+        self.addr2_var = add_mdac_config_row(mdac_config_frame, "住宿地址2:", "address2", 6)
+        self.postcode_var = add_mdac_config_row(mdac_config_frame, "邮编:", "postcode", 7)
 
         self.test_mode_var = tk.BooleanVar(value=self.config.get("test_mode", True))
         test_mode_check = ttk.Checkbutton(mdac_config_frame, text="测试模式 (不提交表单)", variable=self.test_mode_var,
                                           command=self.save_config)
-        test_mode_check.grid(row=7, column=0, columnspan=3, sticky=tk.W, pady=5)
+        test_mode_check.grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=5)
 
         mdac_button_frame = ttk.Frame(self.mdac_tab)
         mdac_button_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
@@ -1480,6 +1484,7 @@ class MDACApp:
         if not excel_path or not os.path.exists(excel_path):
             messagebox.showerror("错误", "请选择有效的 Excel 文件路径！")
             return
+        self.save_config()
         self.excel_manager = ExcelManager(excel_path)
         self.is_mdac_running = True
         self.is_mdac_paused = False
