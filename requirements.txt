@@ -4,8 +4,3 @@ pyTelegramBotAPI
 openpyxl
 filelock
 pillow
-pymupdf
-paddleocr
-paddlepaddle
-opencv-python-headless
-numpy

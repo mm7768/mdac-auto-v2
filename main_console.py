@@ -12,18 +12,8 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter import scrolledtext
-from datetime import datetime, timedelta
+from datetime import datetime
 from queue import Queue
-from pathlib import Path
-
-# 某些 CPU 环境下 PaddlePaddle oneDNN 会触发推理运行时兼容错误，默认关闭该路径。
-os.environ.setdefault("FLAGS_use_mkldnn", "0")
-os.environ.setdefault("FLAGS_use_onednn", "0")
-
-try:
-    import fitz  # PyMuPDF
-except ImportError:
-    fitz = None
 
 import ddddocr
 from PIL import Image
@@ -32,7 +22,6 @@ from playwright.sync_api import sync_playwright
 
 import telebot
 from filelock import FileLock
-from mrz import MRZParser
 
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 CONFIG_FILE = "../dist/text/mdac_settings.json"
@@ -64,147 +53,12 @@ class LogQueue:
 log_queue = LogQueue()
 
 # ==========================================
-# 1. 并发模块 (FileLock 封装 Excel 读写)
+# Excel 文件锁与状态管理
 # ==========================================
 class ExcelManager:
-    def __init__(self, file_path, batch_mode=False, batch_size=10, batch_interval_seconds=30):
+    def __init__(self, file_path):
         self.file_path = file_path
         self.lock = FileLock(f"{file_path}.lock", timeout=30)
-        self.batch_mode = batch_mode
-        self.batch_size = max(1, batch_size)
-        self.batch_interval_seconds = max(1, batch_interval_seconds)
-        self._batch_lock = threading.RLock()
-        self._batch_flush_lock = threading.Lock()
-        self._pending_customers = []
-        self._pending_passports = set()
-        self._last_batch_flush = time.monotonic()
-
-    def queue_customer(self, customer_data, remark=None):
-        """将新增客户暂存到内存，达到数量或时间阈值后批量保存。"""
-        passport = str(customer_data.get("passport", "")).strip().upper()
-        with self._batch_lock:
-            if passport and passport in self._pending_passports:
-                return None
-            self._pending_customers.append((dict(customer_data), remark))
-            if passport:
-                self._pending_passports.add(passport)
-            should_flush = (
-                len(self._pending_customers) >= self.batch_size
-                or time.monotonic() - self._last_batch_flush >= self.batch_interval_seconds
-            )
-        if should_flush and not self.flush_pending():
-            return None
-        return True
-
-    def flush_pending(self):
-        """串行执行批量保存，避免停止线程与处理线程同时写入。"""
-        if not self._batch_flush_lock.acquire(blocking=False):
-            return True
-        try:
-            return self._flush_pending_impl()
-        finally:
-            self._batch_flush_lock.release()
-
-    def _flush_pending_impl(self):
-        """安全地将暂存记录一次性写入 Excel；失败时保留内存队列以便重试。"""
-        with self._batch_lock:
-            if not self._pending_customers:
-                return True
-            pending = list(self._pending_customers)
-
-        try:
-            with self.lock:
-                wb = load_workbook(self.file_path)
-                sheet = wb.active
-                existing_passports = {
-                    str(sheet[f"B{row}"].value).strip().upper()
-                    for row in range(2, sheet.max_row + 1)
-                    if sheet[f"B{row}"].value
-                }
-
-                for customer_data, remark in pending:
-                    passport = str(customer_data.get("passport", "")).strip().upper()
-                    if passport and passport in existing_passports:
-                        continue
-
-                    row = 2
-                    while row <= sheet.max_row:
-                        if all(sheet.cell(row=row, column=c).value is None for c in range(1, 13)):
-                            break
-                        row += 1
-                    if row > sheet.max_row:
-                        row = sheet.max_row + 1
-
-                    def format_date_to_str(dt):
-                        if not dt:
-                            return ""
-                        return f"{dt.day}-{dt.strftime('%b-%y')}"
-
-                    sheet[f"A{row}"] = customer_data["name"]
-                    sheet[f"B{row}"] = customer_data["passport"]
-                    sheet[f"C{row}"] = format_date_to_str(customer_data["dob"])
-                    sheet[f"D{row}"] = customer_data["sex_text"]
-                    sheet[f"E{row}"] = format_date_to_str(customer_data["passport_exp"])
-                    sheet[f"I{row}"] = "缺少日期"
-                    if remark is not None:
-                        sheet[f"K{row}"] = remark
-                    sheet[f"L{row}"] = customer_data["nationality"]
-                    if passport:
-                        existing_passports.add(passport)
-
-                wb.save(self.file_path)
-
-            with self._batch_lock:
-                del self._pending_customers[:len(pending)]
-                self._pending_passports = {
-                    str(data.get("passport", "")).strip().upper()
-                    for data, _ in self._pending_customers
-                    if data.get("passport")
-                }
-                self._last_batch_flush = time.monotonic()
-            return True
-        except Exception as e:
-            log_queue.put(f"❌ Excel 批量保存失败: {e}", level="ERROR", target_tab="PDF")
-            return False
-
-    def append_customer(self, customer_data, remark=None):
-        if self.batch_mode:
-            return self.queue_customer(customer_data, remark)
-        try:
-            with self.lock:
-                wb = load_workbook(self.file_path)
-                sheet = wb.active
-
-                # 寻找第一个真正的空行（A列到L列全部为空）
-                row = 2  # 从第2行开始，跳过表头
-                while row <= sheet.max_row:
-                    if all(sheet.cell(row=row, column=c).value is None for c in range(1, 13)):
-                        break  # 找到了空行
-                    row += 1
-                # 如果都没找到空行，就在最后追加
-                if row > sheet.max_row:
-                    row = sheet.max_row + 1
-
-                def format_date_to_str(dt):
-                    if not dt:
-                        return ""
-                    return f"{dt.day}-{dt.strftime('%b-%y')}"
-
-                sheet[f"A{row}"] = customer_data['name']
-                sheet[f"B{row}"] = customer_data['passport']
-                sheet[f"C{row}"] = format_date_to_str(customer_data['dob'])
-                sheet[f"D{row}"] = customer_data['sex_text']
-                sheet[f"E{row}"] = format_date_to_str(customer_data['passport_exp'])
-                sheet[f"I{row}"] = "缺少日期"  # 修改点：标记为缺少日期
-                if remark is not None:
-                    sheet[f"K{row}"] = remark
-                sheet[f"L{row}"] = customer_data['nationality']
-
-                wb.save(self.file_path)
-                return row
-        except Exception as e:
-            log_queue.put(f"❌ Excel 写入失败: {e}", level="ERROR", target_tab="Telegram")
-            return None
 
     def update_status(self, row, new_status, remark=None):
         try:
@@ -218,25 +72,6 @@ class ExcelManager:
                 wb.save(self.file_path)
         except Exception as e:
             log_queue.put(f"❌ Excel 状态更新失败 (行 {row}): {e}", level="ERROR", target_tab="MDAC")
-
-    def check_duplicate(self, passport):
-        passport_key = str(passport or "").strip().upper()
-        if self.batch_mode:
-            with self._batch_lock:
-                if passport_key in self._pending_passports:
-                    return True
-        try:
-            with self.lock:
-                wb = load_workbook(self.file_path)
-                sheet = wb.active
-                for row in range(2, sheet.max_row + 1):  # 从第二行开始检查数据
-                    cell_val = sheet[f"B{row}"].value
-                    if cell_val and str(cell_val).strip().upper() == passport.upper():
-                        return True
-                return False
-        except Exception as e:
-            log_queue.put(f"❌ Excel 查重失败: {e}", level="ERROR", target_tab="Telegram")
-            return False
 
     # ==========================================
     # Tab 3 专用：按护照号查找并写入 PIN 码
@@ -268,347 +103,9 @@ class ExcelManager:
 
 
 # ==========================================
-# 2. OCR 与 MRZ 解析模块
+# 2. 核心自动化逻辑 (Tab 1 MDAC)
 # ==========================================
-# 实现已独立迁移到 mrz/ 包；这里保留 MRZParser 名称，
-# 由兼容门面为 Telegram/PDF 提供旧字段和 parse_image() 调用协议。
 
-# ==========================================
-# 3. Telegram 监听模块 (保持不变)
-# ==========================================
-class TelegramBot:
-    def __init__(self, token, excel_manager, mrz_parser, log_queue):
-        self.token = token
-        self.bot = telebot.TeleBot(token)
-        self.excel_manager = excel_manager
-        self.mrz_parser = mrz_parser
-        self.log_queue = log_queue
-        self.last_update_id = 0
-        self.running = False
-        self.polling_interval_minutes = 60  # 默认60分钟
-
-        # 注册消息处理器
-        @self.bot.message_handler(content_types=['photo'])
-        def handle_photo(message):
-            self.log_queue.put(f"收到来自 {message.from_user.first_name} 的图片", target_tab="Telegram")
-            self.process_telegram_photo(message)
-
-        @self.bot.message_handler(commands=['start', 'help'])
-        def send_welcome(message):
-            self.safe_reply(message, "你好！请直接发送护照图片给我，我会自动识别并录入Excel。")
-            self.log_queue.put(f"收到来自 {message.from_user.first_name} 的 /start 或 /help 命令",
-                               target_tab="Telegram")
-
-        @self.bot.message_handler(func=lambda message: True)
-        def echo_all(message):
-            self.safe_reply(message, "我只能处理护照图片哦，请直接发送图片给我。")
-            self.log_queue.put(f"收到来自 {message.from_user.first_name} 的非图片消息: {message.text}",
-                               target_tab="Telegram")
-
-    def set_polling_interval(self, minutes):
-        self.polling_interval_minutes = max(1, minutes)  # 最小1分钟
-
-    def safe_reply(self, message, text):
-        """安全回复消息，如果原消息被删除则直接发送到频道"""
-        try:
-            self.bot.reply_to(message, text)
-        except Exception as e:
-            if "message to be replied not found" in str(e):
-                try:
-                    self.bot.send_message(message.chat.id, text)
-                except Exception as e2:
-                    self.log_queue.put(f"❌ 无法发送消息: {e2}", level="ERROR", target_tab="Telegram")
-            else:
-                self.log_queue.put(f"❌ 回复消息时发生错误: {e}", level="ERROR", target_tab="Telegram")
-
-    def process_telegram_photo(self, message):
-        try:
-            file_info = self.bot.get_file(message.photo[-1].file_id)
-            downloaded_file = self.bot.download_file(file_info.file_path)
-            img_bytes = io.BytesIO(downloaded_file)
-
-            success, result = self.mrz_parser.parse_image(img_bytes)
-
-            if success:
-                passport_num = result['passport']
-                if self.excel_manager.check_duplicate(passport_num):
-                    self.safe_reply(message, f"⚠️ 护照号 {passport_num} 已存在于 Excel 中，已跳过。")
-                    self.log_queue.put(f"⚠️ 护照号 {passport_num} 已存在，已跳过。", level="WARNING",
-                                       target_tab="Telegram")
-                    # 修改点：如果护照已存在，标记为已读
-                    self.last_update_id = message.message_id
-                else:
-                    row = self.excel_manager.append_customer(result)
-                    if row:
-                        self.safe_reply(message,
-                                        f"✅ 识别成功！姓名: {result['name']}, 护照号: {result['passport']}. 已写入 Excel 第 {row} 行。请在 Excel 中补充日期并将状态改为 PENDING。")
-                        self.log_queue.put(
-                            f"✅ 识别成功！姓名: {result['name']}, 护照号: {result['passport']}. 已写入 Excel 第 {row} 行。",
-                            target_tab="Telegram")
-                        # 修改点：写入成功，标记为已读
-                        self.last_update_id = message.message_id
-                    else:
-                        self.safe_reply(message, f"❌ 识别成功但写入 Excel 失败。")
-                        self.log_queue.put(f"❌ 识别成功但写入 Excel 失败。", level="ERROR", target_tab="Telegram")
-                        # 写入失败，不标记为已读，下次重启会重新尝试
-            else:
-                self.safe_reply(message, f"❌ 识别失败: {result}")
-                self.log_queue.put(f"❌ 识别失败: {result}", level="ERROR", target_tab="Telegram")
-                # 识别失败，不标记为已读，下次重启会重新尝试
-
-        except Exception as e:
-            self.log_queue.put(f"❌ 处理图片时发生未知错误: {e}", level="ERROR", target_tab="Telegram")
-            # 发生未知错误，不标记为已读，下次重启会重新尝试
-
-    def start_polling_thread(self):
-        if self.running:
-            return
-        self.running = True
-        self._polling_thread = threading.Thread(target=self._long_polling, daemon=True)
-        self._polling_thread.start()
-        self.log_queue.put(f"Telegram 监听线程已启动，每 {self.polling_interval_minutes} 分钟拉取一次。",
-                           target_tab="Telegram")
-
-    def stop_polling_thread(self):
-        self.running = False
-        polling_thread = getattr(self, "_polling_thread", None)
-        if polling_thread and polling_thread.is_alive() and polling_thread is not threading.current_thread():
-            polling_thread.join(timeout=70)
-        self.log_queue.put("Telegram 监听线程正在停止...", target_tab="Telegram")
-
-    def _long_polling(self):
-        while self.running:
-            try:
-                updates = self.bot.get_updates(
-                    offset=self.last_update_id + 1,
-                    timeout=60,
-                )
-
-                # 检查是否有撤回消息
-                for update in updates:
-                    # 如果有编辑消息（可能是撤回）或者消息已经被删除
-                    if hasattr(update, 'edited_message') and update.edited_message:
-                        # 这是被撤回的消息，跳过处理
-                        self.log_queue.put(f"⚠️ 检测到撤回消息，已忽略。", target_tab="Telegram")
-                        continue
-                    if hasattr(update, 'message') and update.message:
-                        # 检查消息是否有效（未被撤回）
-                        if hasattr(update.message, 'edit_date') and update.message.edit_date:
-                            # 消息被修改过，可能是撤回
-                            self.log_queue.put(f"⚠️ 检测到修改后的消息，可能已撤回，跳过处理。", target_tab="Telegram")
-                            continue
-                        # 正常处理消息
-                        self.bot.process_new_updates([update])
-                        self.last_update_id = update.update_id
-                    elif hasattr(update, 'channel_post') and update.channel_post:
-                        # 频道消息也需要处理
-                        if hasattr(update.channel_post, 'edit_date') and update.channel_post.edit_date:
-                            continue
-                        self.bot.process_new_updates([update])
-                        self.last_update_id = update.update_id
-
-                if self.running:  # 检查是否在处理过程中被要求停止
-                    time_to_sleep = self.polling_interval_minutes * 60
-                    self.log_queue.put(f"[Telegram] 等待中... 距离下次拉取还有 {self.polling_interval_minutes} 分钟",
-                                       target_tab="Telegram")
-                    for i in range(time_to_sleep):
-                        if not self.running:  # 允许在等待中途停止
-                            break
-                        time.sleep(1)
-
-            except Exception as e:
-                self.log_queue.put(f"❌ Telegram 监听发生错误: {e}. 10秒后重试...", level="ERROR",
-                                   target_tab="Telegram")
-                time.sleep(10)
-        self.log_queue.put("Telegram 监听线程已停止。", target_tab="Telegram")
-
-
-
-# ==========================================
-# 3B. Tab 4：PDF MRZ 批处理模块
-# ==========================================
-# PDF 处理器复用 mrz.MRZParser，与 Telegram 图片链路使用同一套 TD3 OCR。
-
-class PDFMRZProcessor:
-    def __init__(self, bot, excel_manager, log_queue, progress_callback=None):
-        self.bot = bot
-        self.excel_manager = excel_manager
-        self.log_queue = log_queue
-        self.progress_callback = progress_callback
-        self.stop_requested = False
-        self.processed_files = set()
-        self.progress_update_interval_seconds = 30
-        self._last_progress_update = 0.0
-
-    def stop(self):
-        self.stop_requested = True
-
-    def _report(self, message, level="INFO"):
-        self.log_queue.put(message, level=level, target_tab="PDF")
-
-    def _progress(self, chat_id, message_id, text):
-        try:
-            if message_id:
-                self.bot.edit_message_text(text, chat_id, message_id)
-            else:
-                message = self.bot.send_message(chat_id, text)
-                return message.message_id
-        except Exception as exc:
-            self._report(f"Telegram 进度更新失败：{exc}", "WARNING")
-        return message_id
-
-    def _result_text(self, filename, total, success, failed, duplicate):
-        failed_pages = ", ".join(str(x) for x in failed) if failed else "无"
-        duplicate_pages = ", ".join(str(x) for x in duplicate) if duplicate else "无"
-        return (f"✅ PDF 处理完成：{filename}\n总页数：{total}\n识别成功：{success}\n"
-                f"失败页：{failed_pages}\n重复跳过页：{duplicate_pages}")
-
-    def process_document(self, message, parser):
-        document = message.document
-        filename = document.file_name or f"telegram_{document.file_id}.pdf"
-        if not filename.lower().endswith(".pdf"):
-            return
-        if document.file_id in self.processed_files:
-            return
-        self.processed_files.add(document.file_id)
-        progress_id = None
-        temp_path = None
-        failed_pages, duplicate_pages = [], []
-        success_count = 0
-        try:
-            if fitz is None:
-                raise RuntimeError("未安装 PyMuPDF，无法读取 PDF")
-            self._report(f"收到 PDF：{filename}")
-            file_info = self.bot.get_file(document.file_id)
-            pdf_bytes = self.bot.download_file(file_info.file_path)
-            temp_dir = Path("../dist/text/pdf_mrz_temp")
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            temp_path = temp_dir / filename
-            temp_path.write_bytes(pdf_bytes)
-            pdf = fitz.open(str(temp_path))
-            total = len(pdf)
-            progress_id = self._progress(message.chat.id, progress_id,
-                f"开始处理：{filename}\n总页数：{total}\n当前进度：0/{total}")
-            self._last_progress_update = time.monotonic()
-            for index in range(total):
-                if self.stop_requested:
-                    self._report("用户请求停止，当前 PDF 已中止。", "WARNING")
-                    break
-                page_no = index + 1
-                try:
-                    page = pdf.load_page(index)
-                    pixmap = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
-                    image_bytes = pixmap.tobytes("png")
-                    ok, result = parser.parse_image(image_bytes)
-                    if not ok:
-                        failed_pages.append(page_no)
-                        self._report(f"第 {page_no} 页识别失败：{result}", "WARNING")
-                    elif self.excel_manager.check_duplicate(result["passport"]):
-                        duplicate_pages.append(page_no)
-                        self._report(f"第 {page_no} 页重复护照号 {result['passport']}，已跳过。", "WARNING")
-                    else:
-                        remark = f"{filename} 第{page_no}页"
-                        row = self.excel_manager.append_customer(result, remark=remark)
-                        if row:
-                            success_count += 1
-                        else:
-                            failed_pages.append(page_no)
-                    progress_text = (
-                        f"正在处理：{filename}\n总页数：{total}\n当前进度：{page_no}/{total}\n"
-                        f"识别成功：{success_count}\n失败：{len(failed_pages)}\n"
-                        f"重复跳过：{len(duplicate_pages)}"
-                    )
-                    now = time.monotonic()
-                    if (
-                        page_no == total
-                        or now - self._last_progress_update >= self.progress_update_interval_seconds
-                    ):
-                        progress_id = self._progress(message.chat.id, progress_id, progress_text)
-                        self._last_progress_update = now
-                except Exception as exc:
-                    failed_pages.append(page_no)
-                    self._report(f"第 {page_no} 页处理异常：{exc}", "ERROR")
-            pdf.close()
-            final_text = self._result_text(filename, total, success_count, failed_pages, duplicate_pages)
-            self._progress(message.chat.id, progress_id, final_text)
-        except Exception as exc:
-            self._report(f"PDF 处理失败：{exc}", "ERROR")
-            self.bot.send_message(message.chat.id, f"❌ PDF 处理失败：{filename}\n原因：{exc}")
-        finally:
-            self.excel_manager.flush_pending()
-            if temp_path and temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except Exception:
-                    pass
-
-
-class PDFTelegramBot:
-    def __init__(self, token, excel_manager, log_queue):
-        self.bot = telebot.TeleBot(token)
-        self.excel_manager = excel_manager
-        self.log_queue = log_queue
-        self.running = False
-        self.last_update_id = 0
-        self.processor = None
-        self.parser = None
-
-        @self.bot.message_handler(content_types=["document"])
-        def handle_document(message):
-            if not message.document or not (message.document.file_name or "").lower().endswith(".pdf"):
-                self.bot.send_message(message.chat.id, "请发送 PDF 文件。")
-                return
-            if self.processor is None:
-                self.bot.send_message(message.chat.id, "Tab 4 尚未准备好，请稍后重试。")
-                return
-            self.processor.process_document(message, self.parser)
-
-        @self.bot.message_handler(commands=["start", "help"])
-        def handle_help(message):
-            self.bot.send_message(message.chat.id, "请直接发送包含护照页面的 PDF 文件。")
-
-        @self.bot.message_handler(func=lambda message: True)
-        def handle_other(message):
-            self.bot.send_message(message.chat.id, "Tab 4 只处理 PDF 文件。")
-
-    def start(self):
-        if self.running:
-            return
-        self.parser = MRZParser()
-        self.processor = PDFMRZProcessor(self.bot, self.excel_manager, self.log_queue)
-        self.running = True
-        self._polling_thread = threading.Thread(target=self._poll, daemon=True)
-        self._polling_thread.start()
-        self.log_queue.put("Tab 4 PDF Telegram Bot 已启动。", target_tab="PDF")
-
-    def stop(self):
-        self.running = False
-        if self.processor:
-            self.processor.stop()
-        polling_thread = getattr(self, "_polling_thread", None)
-        if polling_thread and polling_thread.is_alive() and polling_thread is not threading.current_thread():
-            polling_thread.join(timeout=70)
-        self.log_queue.put("Tab 4 PDF Telegram Bot 正在停止。", target_tab="PDF")
-
-    def _poll(self):
-        while self.running:
-            try:
-                updates = self.bot.get_updates(
-                    offset=self.last_update_id + 1,
-                    timeout=60,
-                )
-                for update in updates:
-                    self.bot.process_new_updates([update])
-                    self.last_update_id = update.update_id
-            except Exception as exc:
-                self.log_queue.put(f"Tab 4 Telegram 错误：{exc}，10 秒后重试。", level="ERROR", target_tab="PDF")
-                for _ in range(10):
-                    if not self.running:
-                        break
-                    time.sleep(1)
-
-# ==========================================
-# 4. 核心自动化逻辑 (完全保留用户原始微调逻辑)
 # ==========================================
 
 def normalize_status(value):
@@ -704,7 +201,6 @@ def process_registration(page, excel_manager, row, customer, config, log_func):
         page.locator("#email").fill(config.get("email", ""))
         page.locator("#confirmEmail").fill(config.get("email", ""))
         page.locator("#mobile").fill(config.get("phone", ""))
-        page.locator("#region").select_option("60")
         page.locator("#trvlMode").select_option("2")
         page.locator("#embark").select_option("CHN")
         page.locator("#vesselNm").fill(config.get("vessel", ""))
@@ -1149,23 +645,13 @@ class MDACApp:
 
         self.config = self.load_config()
         self.excel_manager = None
-        self.telegram_bot = None
-        self.mrz_parser = MRZParser()
-
         self.is_mdac_running = False
         self.is_mdac_paused = False
         self.mdac_thread = None
 
-        self.is_telegram_running = False
-        self.telegram_thread = None
-
         # Tab 3 状态
         self.is_gmail_running = False
         self.gmail_fetcher = None
-
-        # Tab 4 状态
-        self.pdf_bot = None
-        self.is_pdf_running = False
 
         self.create_widgets()
         self.process_log_queue()
@@ -1180,12 +666,10 @@ class MDACApp:
         return {
             "excel_path": "", "email": "", "phone": "", "region": "60", "vessel": "",
             "address1": "", "address2": "", "postcode": "", "test_mode": True,
-            "telegram_token": "", "telegram_interval": 60,
             # Tab 3 Gmail 配置
             "gmail_address": "", "gmail_app_password": "",
             "gmail_interval": 10,
             "gmail_telegram_token": "", "gmail_chat_id": "",
-            "pdf_telegram_token": "", "pdf_excel_path": "",
         }
 
     def save_config(self):
@@ -1199,16 +683,12 @@ class MDACApp:
             "address2": self.addr2_var.get(),
             "postcode": self.postcode_var.get(),
             "test_mode": self.test_mode_var.get(),
-            "telegram_token": self.telegram_token_var.get(),
-            "telegram_interval": int(self.telegram_interval_var.get()) if self.telegram_interval_var.get() else 60,
             # Tab 3 Gmail 配置
             "gmail_address": self.gmail_address_var.get(),
             "gmail_app_password": self.gmail_app_password_var.get(),
             "gmail_interval": int(self.gmail_interval_var.get()) if self.gmail_interval_var.get() else 10,
             "gmail_telegram_token": self.gmail_telegram_token_var.get(),
             "gmail_chat_id": self.gmail_chat_id_var.get(),
-            "pdf_telegram_token": self.pdf_telegram_token_var.get(),
-            "pdf_excel_path": self.pdf_excel_var.get(),
         }
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -1278,42 +758,6 @@ class MDACApp:
         self.mdac_log_text = scrolledtext.ScrolledText(mdac_log_frame, wrap=tk.WORD, height=15, font=("微软雅黑", 9))
         self.mdac_log_text.pack(fill="both", expand=True)
 
-        # Tab 2: Telegram 监听
-        self.telegram_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.telegram_tab, text="Telegram 监听")
-
-        telegram_config_frame = ttk.LabelFrame(self.telegram_tab, text=" Telegram 设置 ", padding=15)
-        telegram_config_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
-
-        ttk.Label(telegram_config_frame, text="Telegram Bot Token:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.telegram_token_var = tk.StringVar(value=self.config.get("telegram_token", ""))
-        ttk.Entry(telegram_config_frame, textvariable=self.telegram_token_var, width=50).grid(row=0, column=1,
-                                                                                              sticky=tk.W, padx=10,
-                                                                                              pady=2)
-
-        ttk.Label(telegram_config_frame, text="监听间隔 (分钟):").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.telegram_interval_var = tk.StringVar(value=str(self.config.get("telegram_interval", 60)))
-        ttk.Entry(telegram_config_frame, textvariable=self.telegram_interval_var, width=10).grid(row=1, column=1,
-                                                                                                 sticky=tk.W, padx=10,
-                                                                                                 pady=2)
-
-        telegram_button_frame = ttk.Frame(self.telegram_tab)
-        telegram_button_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
-
-        self.start_telegram_btn = ttk.Button(telegram_button_frame, text="启动 Telegram 监听",
-                                             command=self.start_telegram_listener)
-        self.start_telegram_btn.pack(side=tk.LEFT, padx=5, pady=5)
-
-        self.stop_telegram_btn = ttk.Button(telegram_button_frame, text="停止 Telegram 监听",
-                                            command=self.stop_telegram_listener, state=tk.DISABLED)
-        self.stop_telegram_btn.pack(side=tk.LEFT, padx=5, pady=5)
-
-        telegram_log_frame = ttk.LabelFrame(self.telegram_tab, text=" Telegram 运行日志 ", padding=10)
-        telegram_log_frame.pack(fill="both", expand=True, padx=5, pady=5)
-        self.telegram_log_text = scrolledtext.ScrolledText(telegram_log_frame, wrap=tk.WORD, height=15,
-                                                              font=("微软雅黑", 9))
-        self.telegram_log_text.pack(fill="both", expand=True)
-
         # ============================================================
         # Tab 3: Gmail PIN 码自动获取（新增）
         # ============================================================
@@ -1382,44 +826,6 @@ class MDACApp:
                                                          font=("微软雅黑", 9))
         self.gmail_log_text.pack(fill="both", expand=True)
 
-        # ============================================================
-        # Tab 4: 护照 PDF MRZ 批处理
-        # ============================================================
-        self.pdf_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.pdf_tab, text="护照 PDF MRZ")
-
-        pdf_config_frame = ttk.LabelFrame(self.pdf_tab, text=" PDF MRZ 批处理设置 ", padding=15)
-        pdf_config_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
-
-        ttk.Label(pdf_config_frame, text="独立 Telegram Bot Token:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.pdf_telegram_token_var = tk.StringVar(value=self.config.get("pdf_telegram_token", ""))
-        ttk.Entry(pdf_config_frame, textvariable=self.pdf_telegram_token_var, width=50, show="*").grid(
-            row=0, column=1, sticky=tk.W, padx=10, pady=2)
-
-        ttk.Label(pdf_config_frame, text="输出 Excel 文件:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.pdf_excel_var = tk.StringVar(value=self.config.get("pdf_excel_path", ""))
-        ttk.Entry(pdf_config_frame, textvariable=self.pdf_excel_var, width=50).grid(
-            row=1, column=1, sticky=tk.W, padx=10, pady=2)
-        ttk.Button(pdf_config_frame, text="选择 Excel...", command=lambda: self.browse_excel_file(self.pdf_excel_var)).grid(
-            row=1, column=2, sticky=tk.W, padx=5, pady=2)
-
-        ttk.Label(pdf_config_frame, text="说明:").grid(row=2, column=0, sticky=tk.NW, pady=2)
-        ttk.Label(pdf_config_frame, text="处理你发送给该 Bot 的 PDF；成功资料按现有 MDAC 格式追加，失败页和重复页通过 Telegram 返回。", wraplength=500).grid(
-            row=2, column=1, columnspan=2, sticky=tk.W, padx=10, pady=2)
-
-        pdf_button_frame = ttk.Frame(self.pdf_tab)
-        pdf_button_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
-        self.start_pdf_btn = ttk.Button(pdf_button_frame, text="启动 PDF 处理", command=self.start_pdf_processor)
-        self.start_pdf_btn.pack(side=tk.LEFT, padx=5, pady=5)
-        self.stop_pdf_btn = ttk.Button(pdf_button_frame, text="停止 PDF 处理", command=self.stop_pdf_processor, state=tk.DISABLED)
-        self.stop_pdf_btn.pack(side=tk.LEFT, padx=5, pady=5)
-        ttk.Button(pdf_button_frame, text="保存配置", command=self.save_config).pack(side=tk.RIGHT, padx=5, pady=5)
-
-        pdf_log_frame = ttk.LabelFrame(self.pdf_tab, text=" PDF MRZ 运行日志 ", padding=10)
-        pdf_log_frame.pack(fill="both", expand=True, padx=5, pady=5)
-        self.pdf_log_text = scrolledtext.ScrolledText(pdf_log_frame, wrap=tk.WORD, height=15, font=("微软雅黑", 9))
-        self.pdf_log_text.pack(fill="both", expand=True)
-
     def browse_excel_file(self, var):
         file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
         if file_path:
@@ -1428,56 +834,22 @@ class MDACApp:
 
     def process_log_queue(self):
         """
-        日志分发：三路分发到对应 Tab 的日志框
-        target_tab: "MDAC" → MDAC框 | "Telegram" → Telegram框 | "Gmail" → Gmail框 | "PDF" → PDF框
-        其他 → 默认进 MDAC 框（保留旧行为）
+        日志分发到保留的 Tab 1/Tab 3 日志框。
+        target_tab: "MDAC" → MDAC框 | "Gmail" → Gmail框
+        其他 → 默认进 MDAC 框。
         """
         while not log_queue.empty():
             message, level, target_tab = log_queue.get()
             if target_tab == "MDAC":
                 txt = self.mdac_log_text
-            elif target_tab == "Telegram":
-                txt = self.telegram_log_text
             elif target_tab == "Gmail":
                 txt = self.gmail_log_text
-            elif target_tab == "PDF":
-                txt = self.pdf_log_text
             else:
                 txt = self.mdac_log_text  # 默认
 
             txt.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n")
             txt.see(tk.END)
         self.root.after(100, self.process_log_queue)
-
-    def start_pdf_processor(self):
-        token = self.pdf_telegram_token_var.get().strip()
-        excel_path = self.pdf_excel_var.get().strip()
-        if not token:
-            messagebox.showerror("错误", "请填写 Tab 4 独立 Telegram Bot Token！")
-            return
-        if not excel_path or not os.path.exists(excel_path):
-            messagebox.showerror("错误", "请选择有效的 Tab 4 输出 Excel 文件！")
-            return
-        self.save_config()
-        try:
-            self.excel_manager = ExcelManager(excel_path, batch_mode=True)
-            self.pdf_bot = PDFTelegramBot(token, self.excel_manager, log_queue)
-            self.pdf_bot.start()
-            self.is_pdf_running = True
-            self.start_pdf_btn.config(state=tk.DISABLED)
-            self.stop_pdf_btn.config(state=tk.NORMAL)
-        except Exception as exc:
-            self.pdf_bot = None
-            messagebox.showerror("启动失败", str(exc))
-            log_queue.put(f"Tab 4 启动失败：{exc}", level="ERROR", target_tab="PDF")
-
-    def stop_pdf_processor(self):
-        if self.pdf_bot:
-            self.pdf_bot.stop()
-        self.pdf_bot = None
-        self.is_pdf_running = False
-        self.start_pdf_btn.config(state=tk.NORMAL)
-        self.stop_pdf_btn.config(state=tk.DISABLED)
 
     def start_mdac_automation(self):
         excel_path = self.excel_var.get()
@@ -1554,69 +926,6 @@ class MDACApp:
             log_queue.put(f"❌ MDAC 线程发生严重错误: {e}", level="ERROR", target_tab="MDAC")
         finally:
             self.stop_mdac_automation()
-
-    def start_telegram_listener(self):
-        token = self.telegram_token_var.get()
-        excel_path = self.excel_var.get()
-        if not token or not os.path.exists(excel_path):
-            messagebox.showerror("错误", "Token 或 Excel 路径无效！")
-            return
-        self.excel_manager = ExcelManager(excel_path)
-        self.telegram_bot = TelegramBot(token, self.excel_manager, self.mrz_parser, log_queue)
-
-        # 修改点：每次启动监听时，同步所有已处理成功的消息
-        try:
-            # 获取所有未读消息
-            updates = self.telegram_bot.bot.get_updates()
-            for update in updates:
-                if update.message and update.message.photo:
-                    # 尝试解析这张旧照片
-                    img_bytes = io.BytesIO(self.telegram_bot.bot.download_file(
-                        self.telegram_bot.bot.get_file(update.message.photo[-1].file_id).file_path))
-                    success, result = self.telegram_bot.mrz_parser.parse_image(img_bytes)
-
-                    if success:
-                        # 如果解析成功，且Excel里没有这个护照号，说明之前漏掉了
-                        if not self.telegram_bot.excel_manager.check_duplicate(result['passport']):
-                            self.telegram_bot.log_queue.put(
-                                f"发现漏掉的旧照片 (护照号: {result['passport']})，正在补录...", target_tab="Telegram")
-                            row = self.telegram_bot.excel_manager.append_customer(result)
-                            if row:
-                                self.telegram_bot.log_queue.put(
-                                    f"✅ 补录成功！姓名: {result['name']} 已写入 Excel 第 {row} 行。", target_tab="Telegram")
-                                self.telegram_bot.last_update_id = update.update_id
-                                continue
-                        else:
-                            # 如果Excel里已经有了，说明已经处理过了，标记为已读
-                            self.telegram_bot.last_update_id = update.update_id
-                            continue
-
-                    # 如果解析失败或者补录失败，保留旧的 update_id 以便下次再试
-                    # 我们不需要做特殊处理，只要不更新 last_update_id 就行
-
-                elif update.message:
-                    # 非照片消息，直接标记为已读
-                    self.telegram_bot.last_update_id = update.update_id
-                elif update.edited_message:
-                    # 撤回的消息，直接标记为已读
-                    self.telegram_bot.last_update_id = update.update_id
-
-            self.telegram_bot.log_queue.put(f"✅ 历史消息状态已同步完毕。", target_tab="Telegram")
-        except Exception as e:
-            self.telegram_bot.log_queue.put(f"⚠️ 同步最新状态失败: {e}", level="WARNING", target_tab="Telegram")
-
-        self.telegram_bot.set_polling_interval(int(self.telegram_interval_var.get()))
-        self.is_telegram_running = True
-        self.start_telegram_btn.config(state=tk.DISABLED)
-        self.stop_telegram_btn.config(state=tk.NORMAL)
-        threading.Thread(target=self.telegram_bot.start_polling_thread, daemon=True).start()
-
-    def stop_telegram_listener(self):
-        if self.telegram_bot:
-            self.telegram_bot.stop_polling_thread()
-        self.is_telegram_running = False
-        self.start_telegram_btn.config(state=tk.NORMAL)
-        self.stop_telegram_btn.config(state=tk.DISABLED)
 
     # ================================================================
     # Tab 3: Gmail PIN 码获取 启动 / 停止

@@ -23,7 +23,6 @@ class MainConsoleCompatibilityTests(unittest.TestCase):
         tkinter.X = "X"
         tkinter.BOTH = "BOTH"
         tkinter.WORD = "WORD"
-        tkinter.Module = types.ModuleType
         tkinter_ttk = types.ModuleType("tkinter.ttk")
         tkinter_filedialog = types.ModuleType("tkinter.filedialog")
         tkinter_messagebox = types.ModuleType("tkinter.messagebox")
@@ -49,9 +48,6 @@ class MainConsoleCompatibilityTests(unittest.TestCase):
             def __init__(self, *args, **kwargs):
                 pass
 
-            def message_handler(self, *args, **kwargs):
-                return lambda func: func
-
         telebot.TeleBot = TeleBot
         sys.modules.setdefault("telebot", telebot)
 
@@ -63,24 +59,23 @@ class MainConsoleCompatibilityTests(unittest.TestCase):
 
         cls.module = importlib.import_module("main_console")
 
-    def test_mrz_facade_is_imported_and_legacy_classes_remain(self):
-        from mrz import MRZParser
-
-        self.assertIs(self.module.MRZParser, MRZParser)
+    def test_tab1_and_tab3_classes_remain(self):
         for name in (
             "ExcelManager",
-            "TelegramBot",
-            "PDFMRZProcessor",
-            "PDFTelegramBot",
             "GmailPINFetcher",
             "MDACApp",
             "process_registration",
         ):
             self.assertTrue(hasattr(self.module, name), name)
 
-    def test_old_ocr_classes_are_removed_without_breaking_parser_name(self):
-        self.assertFalse(hasattr(self.module, "_PaddleOCRAdapter"))
-        self.assertFalse(hasattr(self.module, "PaddleMRZParser"))
+    def test_tab2_tab4_and_mrz_components_are_removed(self):
+        for name in (
+            "TelegramBot",
+            "PDFMRZProcessor",
+            "PDFTelegramBot",
+            "MRZParser",
+        ):
+            self.assertFalse(hasattr(self.module, name), name)
 
 
 if __name__ == "__main__":

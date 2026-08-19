@@ -1,78 +1,87 @@
-# MDAC All-in-One Console (MDAC 全自动中央控制台)
+# MDAC Auto V2
 
-这是一个为马来西亚入境卡 (MDAC) 自动化处理而设计的集成控制台。它结合了 Playwright 网页自动化、Telegram 机器人数据采集、OCR 护照识别、**Gmail PIN 码自动获取**以及 Excel 并发管理，旨在大幅提升 MDAC 的处理效率。
+这是一个面向马来西亚数字入境卡（MDAC）处理的 Windows 桌面控制台。当前版本保留两条核心流程：使用 Excel 驱动 MDAC 网页自动化，以及从 Gmail 自动提取移民局发送的 PIN 并回填 Excel。
 
-## 🚀 核心功能
+## 当前功能
 
-*   **四标签页 UI 控制台**:
-    *   **MDAC 控制页**: 一键启动自动化填表，实时监控 Excel 状态。
-    *   **Telegram 监听页**: 开启机器人监听，自动从聊天中提取护照信息。
-    *   **Gmail PIN 获取页**: 自动从 Gmail 收集移民局发送的 PIN 码并匹配回填。
-    *   **护照 PDF MRZ 页**: 使用独立 Telegram Bot 批量处理 PDF 每页护照，并回传进度、失败页和重复跳过页。
-*   **智能 Telegram 机器人**:
-    *   自动接收用户发送的护照照片。
-    *   **内存 OCR**: 使用 PaddleOCR 在内存中直接处理图片，不留本地缓存，保护隐私。
-    *   **MRZ 自动解析**: 自动提取护照号、姓名、国籍、出生日期及有效期。
-*   **Gmail 自动化 (NEW)**:
-    *   **IMAP 实时监控**: 定时扫描来自 `mdac@imi.gov.my` 的邮件。
-    *   **Message-ID 去重**: 记录已处理邮件，防止重复抓取，支持人工提前查阅。
-    *   **智能匹配**: 基于护照号精准匹配 Excel 记录，自动回填 PIN 码并更新状态为 `COMPLETED`。
-    *   **异常报警**: 若邮件中的护照号在 Excel 中缺失，自动通过 Telegram 推送详细报警。
-*   **高效自动化执行**:
-    *   **Playwright 驱动**: 模拟真实浏览器行为，稳定填表。
-    *   **ddddocr 验证码识别**: 自动处理滑块验证码。
-*   **并发安全管理**:
-    *   基于 `filelock` 的 Excel 管理器，确保 UI 刷新、机器人写入、邮件回填与自动化执行之间的数据一致性。
-    *   **自动日期格式化**: 严格执行 `d-Mon-yy` (如 `1-May-26`) 的日期格式要求。
+| 功能区域 | 作用 |
+|---|---|
+| MDAC 控制 | 读取 Excel 中状态为 `PENDING` 的客户，自动填写 MDAC 表单、处理滑块并提交；支持测试模式、暂停和停止 |
+| Gmail PIN 获取 | 定时读取来自 `mdac@imi.gov.my` 的邮件，提取姓名、护照号和 PIN，匹配 Excel 后写入 H 列，并将状态改为 `COMPLETED` |
 
-## 🛠️ 安装要求
+项目已移除 Telegram 图片识别、PDF MRZ 批处理、PaddleOCR 和 MRZ 解析包。客户资料应通过当前采用的其他业务流程准备并写入 Excel，之后由 MDAC 控制流程继续处理。
 
-在运行之前，请确保你的环境中已安装以下组件：
+## Excel 数据约定
 
-1.  **Python 3.10+**
-2.  **Chrome 浏览器** (建议使用系统原生安装的 Chrome)
-3.  **依赖库安装**:
-    ```bash
-    pip install playwright ddddocr pyTelegramBotAPI openpyxl filelock pillow pymupdf paddleocr paddlepaddle
-    playwright install chromium
-    ```
+MDAC 控制流程从活动工作表第 2 行开始读取资料。主要字段如下：
 
-## ⚙️ 配置说明
+| 列 | 字段 | 用途 |
+|---|---|---|
+| A | Name | MDAC 姓名 |
+| B | Passport | 护照号码 |
+| C | Date of Birth | 出生日期 |
+| D | Sex | `男` 或 `女` |
+| E | Date of Expiry | 护照有效期 |
+| F | Date of Arrival | 抵达日期 |
+| G | Date of Departure | 离境日期 |
+| H | PIN | Gmail PIN 回填位置 |
+| I | Status | 控制处理状态 |
+| J | Last Check | 状态更新时间 |
+| K | Remark | 备注、错误或人工检查说明 |
+| L | Nationality | 国籍 |
 
-首次运行程序会生成 `mdac_settings.json` 配置文件，你需要在 UI 界面或文件中配置以下内容：
+Tab 1 只会自动处理 I 列为 `PENDING` 的记录。常见状态包括 `PROCESSING`、`TESTED`、`REGISTERED`、`MANUAL_CHECK`、`ERROR` 和 `COMPLETED`。
 
-*   **Excel 路径**: 存放 MDAC 数据的 `.xlsx` 文件路径。
-*   **Telegram Token**: 你的 Telegram Bot API Token。
-*   **Gmail 配置**: 需开启 Google 账号的“两步验证”并生成 **16 位应用专用密码**。
-*   **固定信息**: 如住宿地址、联系方式等默认填表信息。
+## MDAC 控制设置
 
-## 📖 使用流程
+Tab 1 的固定资料设置包括 Excel 路径、Email、手机号、区域代码、航班或船名、住宿地址和邮编。`region` 已改为面板可设置变量，默认值为 `60`，并会保存到 `mdac_settings.json`。面板中的区域代码应填写 MDAC 网页下拉选项对应的 value。
 
-1.  **准备数据**: 在 Excel 中维护客户基本信息。
-2.  **开启监听**: 在控制台切换到 "Telegram 监听" 标签页，点击“开启监听”。
-3.  **采集信息**: 客户向机器人发送护照照片，机器人会自动解析并写入 Excel，状态标记为 `缺少日期`。
-4.  **手动确认**: 管理员在 Excel 中补全日期并将状态改为 `PENDING`。
-5.  **开始填表**: 在控制台点击“开始执行 MDAC”，程序将自动完成注册。
-6.  **PDF 批处理**: 在 Tab 4 选择同格式 Excel、填写独立 Bot Token，启动后发送 PDF；程序逐页识别并回传进度，完成后返回失败页和重复跳过页。
-7.  **自动收码**: 开启 "Gmail PIN 获取" 监听，脚本会自动抓取移民局发来的 PIN 码并填入 Excel H 列，状态自动更新为 `COMPLETED`。
+网页日期字段要求使用 `DD/MM/YYYY` 格式，例如：
 
-## 🔍 MRZ OCR 模块
-
-MRZ 识别已独立拆分到 `mrz/` 包，Telegram 图片和 PDF 页面共用同一套 TD3 Passport 流程：预处理、多个 ROI/增强版本 OCR、两行重建、ICAO 7-3-1 校验位、字段感知 OCR 纠错和 confidence 评分。只有两行各 44 字符、五类 checksum 全部通过且 confidence 达到 90 分时，结果才会进入原有 Excel 写入流程；未通过时保持原有识别失败路径，不会自动写入 MDAC 数据。
-
-主要模块包括 `preprocess.py`、`ocr.py`、`parser.py`、`checksum.py`、`corrector.py`、`engine.py` 和 `legacy.py`。`legacy.py` 保留现有 `MRZParser.parse_image()` 返回协议，因此 Playwright、Excel、Telegram、PDF、Gmail 和 MDAC 提交流程无需改写。`personal_number` 会保留在结构化识别结果和诊断信息中，但当前不新增 Excel 列。
-
-运行 MRZ 回归测试：
-
-```bash
-python3 -m unittest discover -s tests -v
+```text
+18/10/1981
+23/04/2036
 ```
 
-## ⚠️ 注意事项
+Excel 日期会先转换为 Python 日期对象，再在提交网页前转换为 MDAC 要求的 `DD/MM/YYYY` 字符串。测试模式下程序不会点击 Submit，便于先在浏览器中检查资料。
 
-*   **护照识别**: 请确保拍摄的护照照片清晰，尤其是底部的 MRZ 区域。
-*   **Gmail 密码**: 必须使用 Google **应用专用密码**，普通登录密码无效。
-*   **文件锁定**: 运行期间请勿手动打开 Excel 文件，以免造成写入冲突。
+## Gmail PIN 获取
+
+Gmail 模块通过 IMAP 定时扫描来自 `mdac@imi.gov.my` 的邮件，并使用 Message-ID 文件避免重复处理。需要在界面配置 Gmail 地址、Google 应用专用密码、检查间隔，以及用于异常报警的 Telegram Bot Token 和 Chat ID。
+
+当邮件中的护照号能在 Excel B 列找到时，PIN 会写入 H 列，I 列状态更新为 `COMPLETED`，J 列记录更新时间。如果找不到对应护照号，程序会通过配置的 Telegram 报警 Bot 提醒人工核查。
+
+## 安装
+
+需要 Python 3.10 或更高版本、Windows Chrome 浏览器以及 Playwright 运行环境：
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
+
+程序使用可见浏览器运行 MDAC 自动化。请确保 Chrome 浏览器可正常启动，并避免在自动化写入期间手动打开同一个 Excel 文件，以减少文件锁冲突。
+
+## 运行
+
+```bash
+python main_console.py
+```
+
+首次运行后，在 MDAC 控制面板填写固定资料并选择 Excel 文件；在 Gmail PIN 面板填写 Gmail 和报警配置。修改配置后可点击保存，启动 MDAC 自动化时程序也会保存当前面板设置。
+
+## 测试
+
+运行兼容性测试：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## 当前范围
+
+本项目当前不包含护照图片识别、iPhone Live Text 文本解析、Telegram 图片接收、PDF 护照批处理或 MRZ OCR。后续如采用新的客户资料输入方案，应确保最终结果写入 Excel，并按照 MDAC 控制流程要求准备完整字段及 `PENDING` 状态。
 
 ---
-*Developed by AI网站生成师 - 粉肠哥*
+
+*Developed for 粉肠哥*
