@@ -1,6 +1,2 @@
-playwright
 ddddocr
-pyTelegramBotAPI
-openpyxl
-filelock
 pillow
